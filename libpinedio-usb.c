@@ -208,7 +208,94 @@ static uint8_t reverse_byte(uint8_t x) {
   return x;
 }
 
+/* The device's USB port path as Linux names it in sysfs: "<bus>-<port>[.<port>...]" ("" when unknown). */
+static void pinedio_port_path(libusb_device *device, char *out, size_t n) {
+  uint8_t ports[8];
+  int cnt = libusb_get_port_numbers(device, ports, (int) sizeof(ports));
+  out[0] = '\0';
+  if (cnt <= 0 || n < 4) {
+    return;
+  }
+  size_t len = (size_t) snprintf(out, n, "%u-%u", (unsigned) libusb_get_bus_number(device), (unsigned) ports[0]);
+  for (int i = 1; i < cnt && len < n; i++) {
+    len += (size_t) snprintf(out + len, n - len, ".%u", (unsigned) ports[i]);
+  }
+  if (len >= n) {
+    out[0] = '\0';                     // truncated: not a path that can match
+  }
+}
+
+/* Pick the one device to use and only then take it (detach its kernel driver, claim interface 0).
+ * Per VID:PID device: the port path first (when one is asked for) without opening anything; then a plain
+ * open and the serial (zeroed buffer, the read checked: iSerialNumber 0 or a failed read = no serial);
+ * a device that does not match is closed and never detached or claimed. Without a serial or port
+ * selector the first device that can be claimed is taken (as before). 0 = inst->handle is the device. */
+static int32_t pinedio_select_device(struct pinedio_inst *inst, const char *port_path) {
+  libusb_device **list;
+  ssize_t cnt = libusb_get_device_list(NULL, &list);
+  int32_t result = -1;
+
+  for (ssize_t i = 0; i < cnt; i++) {
+    libusb_device *device = list[i];
+    struct libusb_device_descriptor desc;
+    if (libusb_get_device_descriptor(device, &desc) != 0
+        || desc.idVendor != inst->options[PINEDIO_OPTION_VID] || desc.idProduct != inst->options[PINEDIO_OPTION_PID]) {
+      continue;
+    }
+    if (port_path != NULL) {
+      char port[32];
+      pinedio_port_path(device, port, sizeof(port));
+      if (strcmp(port, port_path) != 0) {
+        continue;                       // not this port: never opened
+      }
+    }
+    libusb_device_handle *handle = NULL;
+    if (libusb_open(device, &handle) != 0 || handle == NULL) {
+      continue;
+    }
+    char serial[9];
+    memset(serial, 0, sizeof(serial));
+    int got = desc.iSerialNumber == 0 ? -1
+              : libusb_get_string_descriptor_ascii(handle, desc.iSerialNumber, (unsigned char *) serial, sizeof(serial));
+    if (got <= 0) {
+      serial[0] = '\0';                 // no serial, or it could not be read
+    }
+    if (inst->options[PINEDIO_OPTION_SEARCH_SERIAL]
+        && (serial[0] == '\0' || strncmp(serial, inst->serial_number, 8) != 0)) {
+      libusb_close(handle);             // not the stick asked for: left as it was
+      continue;
+    }
+#ifdef __linux__
+    // On Windows, driver needs to be replaced manually by Zadig
+    int ret = libusb_detach_kernel_driver(handle, 0);
+    if (ret != 0 && ret != LIBUSB_ERROR_NOT_FOUND) {
+      fprintf(stderr, "Cannot detach the existing USB driver. Claiming the interface may fail: %s\n",
+              libusb_error_name(ret));
+    }
+#endif
+    if (libusb_claim_interface(handle, 0) != 0) {
+      fprintf(stderr, "Failed to claim interface 0.\n");
+      libusb_close(handle);
+      if (inst->options[PINEDIO_OPTION_SEARCH_SERIAL] || port_path != NULL) {
+        break;                          // the stick asked for cannot be taken: no other one instead
+      }
+      continue;
+    }
+    libusb_get_string_descriptor(handle, desc.iProduct, 0, (unsigned char *) inst->product_string, 96);
+    memcpy(inst->serial_number, serial, sizeof(serial));
+    inst->handle = handle;
+    result = 0;
+    break;
+  }
+  libusb_free_device_list(list, 1);
+  return result;
+}
+
 int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
+  return pinedio_init_at_port(inst, driver, NULL);
+}
+
+int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char *port_path) {
   int32_t ret;
   inst->int_running_cnt = 0;
   inst->pin_poll_thread_exit = false;
@@ -239,50 +326,9 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
   }
 
   // discover devices
-  libusb_device **list;
-  libusb_device *found = NULL;
-  ssize_t cnt = libusb_get_device_list(NULL, &list);
-  ssize_t i = 0;
-
-  for (i = 0; i < cnt; i++) {
-    libusb_device *device = list[i];
-    struct libusb_device_descriptor desc;
-    ret = libusb_get_device_descriptor(device, &desc);
-
-    if (desc.idVendor == inst->options[PINEDIO_OPTION_VID] && desc.idProduct == inst->options[PINEDIO_OPTION_PID] ) {
-      found = device;
-      ret = libusb_open(found, &inst->handle);
-      if (inst->handle != NULL) {
-
-#ifdef __linux__
-        // On Windows, driver needs to be replaced manually by Zadig
-        ret = libusb_detach_kernel_driver(inst->handle, 0);
-        if (ret != 0 && ret != LIBUSB_ERROR_NOT_FOUND) {
-          fprintf(stderr, "Cannot detach the existing USB driver. Claiming the interface may fail: %s\n",
-                libusb_error_name(ret));
-        }
-#endif
-        ret = libusb_claim_interface(inst->handle, 0);
-        if (ret != 0) {
-          fprintf(stderr, "Failed to claim interface 0: %s\n", libusb_error_name(ret));
-          libusb_close(inst->handle);
-          inst->handle = NULL;
-        } else {
-          char _serial[9];
-          libusb_get_string_descriptor_ascii(inst->handle, desc.iSerialNumber, _serial, 9);
-          libusb_get_string_descriptor(inst->handle, desc.iProduct, 0, inst->product_string, 96);
-          if (inst->options[PINEDIO_OPTION_SEARCH_SERIAL] && strncmp(_serial, inst->serial_number, 8) != 0) {
-            libusb_close(inst->handle);
-            inst->handle = NULL;
-          } else {
-            strncpy(inst->serial_number, _serial, 9);
-            break;
-          }
-        }
-      }
-    }
+  if (pinedio_select_device(inst, port_path) != 0) {
+    inst->handle = NULL;
   }
-  libusb_free_device_list(list, 1);
 
   if (inst->handle == NULL) {
     // TODO: Rework this so we can receive error and print it.
