@@ -74,6 +74,8 @@ struct pinedio_inst {
 };
 
 int32_t pinedio_init(struct pinedio_inst* inst, void* driver);
+/* Defined where pinedio_init_at_port exists, so a caller builds against either library. */
+#define PINEDIO_HAS_INIT_AT_PORT 1
 /* As pinedio_init, but only the device on USB port `port_path` ("<bus>-<port>[.<port>...]", the sysfs name);
  * with PINEDIO_OPTION_SEARCH_SERIAL its serial must match too. NULL = any port (pinedio_init). */
 int32_t pinedio_init_at_port(struct pinedio_inst* inst, void* driver, const char *port_path);
