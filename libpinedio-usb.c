@@ -255,9 +255,13 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
       if (inst->handle != NULL) {
         // Compare the serial before detaching the driver or claiming the interface:
         // a device that is not the one searched for is left as it was
-        char _serial[9];
-        libusb_get_string_descriptor_ascii(inst->handle, desc.iSerialNumber, _serial, 9);
-        if (inst->options[PINEDIO_OPTION_SEARCH_SERIAL] && strncmp(_serial, inst->serial_number, 8) != 0) {
+        char _serial[9] = {0};
+        if (desc.iSerialNumber == 0
+            || libusb_get_string_descriptor_ascii(inst->handle, desc.iSerialNumber, (unsigned char *) _serial, 9) <= 0) {
+          _serial[0] = '\0'; // no serial, or it could not be read
+        }
+        if (inst->options[PINEDIO_OPTION_SEARCH_SERIAL]
+            && (_serial[0] == '\0' || strncmp(_serial, inst->serial_number, 8) != 0)) {
           libusb_close(inst->handle);
           inst->handle = NULL;
           continue;
