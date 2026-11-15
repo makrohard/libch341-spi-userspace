@@ -62,11 +62,15 @@ struct pinedio_inst {
    * data bytes to each 32-byte packet with command + 31 bytes of data... */
   struct libusb_transfer *transfer_out;
   struct libusb_transfer *transfer_ins[USB_IN_TRANSFERS];
-  uint8_t int_running_cnt;
-  pthread_mutex_t usb_access_mutex;
-  pthread_t pin_poll_thread;
-  bool pin_poll_thread_exit;
-  bool in_error;
+  uint8_t int_running_cnt;          /* pins with a callback (enabled) */
+  pthread_mutex_t usb_access_mutex;  /* every USB transfer, the pin table and the fields below */
+  pthread_t pin_poll_thread;         /* the poll worker: started by init, joined by deinit */
+  bool pin_poll_thread_exit;         /* unused since the worker lives from init to deinit */
+  bool in_error;                     /* set by the first failed poll; stays set until deinit */
+  pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
+  bool worker_started;
+  bool closing;                      /* deinit has begun: every later call is refused */
+  int api_active;                    /* calls between their entry and their last unlock (atomic) */
   struct pinedio_inst_int interrupts[PINEDIO_INT_PIN_MAX];
   uint32_t options[PINEDIO_OPTION_MAX];
   char serial_number[9];
@@ -86,6 +90,11 @@ int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_
 int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count);
 int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
+/* Interrupts are polled by one worker thread per instance, started by init and joined by deinit. attach and
+ * detach only enable or disable a pin; they never start, stop or wait for a thread. A callback runs on the
+ * worker without the library's mutex; it may attach and detach, it must not deinit (refused). A callback the
+ * worker took before a detach may still run once after that detach returned; none runs after deinit returns.
+ * After deinit has begun, attach is refused (-1). */
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
 void pinedio_deinit(struct pinedio_inst* inst);

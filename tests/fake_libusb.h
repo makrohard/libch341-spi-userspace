@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <libusb.h>
 
@@ -81,11 +82,45 @@ int libusb_control_transfer(libusb_device_handle *h, uint8_t t, uint8_t r, uint1
   (void) h; (void) t; (void) r; (void) v; (void) i; (void) to; if (n) b[0] = 0; return 0;
 }
 const char *libusb_error_name(int e) { (void) e; return "fake"; }
-struct libusb_transfer *libusb_alloc_transfer(int n) { (void) n; return NULL; }
-void libusb_free_transfer(struct libusb_transfer *t) { (void) t; }
-int libusb_submit_transfer(struct libusb_transfer *t) { (void) t; return LIBUSB_ERROR_IO; }
+/* Transfers. By default every transfer fails (IO), as before. With g_fake_io_ok set, transfers are allocated,
+ * a submit queues the transfer and libusb_handle_events_timeout completes the queue: an IN transfer reads the
+ * scripted input word g_fake_in[0..2]; g_fake_fail makes every submit fail again (a gone device). Submit and
+ * handle_events run under the library's USB mutex, so the queue needs no lock of its own. */
+static int g_fake_io_ok;
+static int g_fake_fail;                 /* atomic: set by the test while the worker polls */
+static uint8_t g_fake_in[3];            /* atomic bytes: the input word the next IN transfer returns */
+static int g_fake_freed;                /* transfers freed */
+static struct libusb_transfer *g_fake_q[2 * 8 + 2];
+static int g_fake_nq;
+struct libusb_transfer *libusb_alloc_transfer(int n) {
+  (void) n;
+  return g_fake_io_ok ? calloc(1, sizeof(struct libusb_transfer)) : NULL;
+}
+void libusb_free_transfer(struct libusb_transfer *t) {
+  if (!t) return;
+  __atomic_fetch_add(&g_fake_freed, 1, __ATOMIC_SEQ_CST);
+  if (g_fake_io_ok) free(t);
+}
+int libusb_submit_transfer(struct libusb_transfer *t) {
+  if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
+  g_fake_q[g_fake_nq++] = t;
+  return 0;
+}
 int libusb_cancel_transfer(struct libusb_transfer *t) { (void) t; return 0; }
-int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) { (void) c; (void) tv; return 0; }
+int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
+  (void) c; (void) tv;
+  int n = g_fake_nq;
+  g_fake_nq = 0;
+  for (int i = 0; i < n; i++) {
+    struct libusb_transfer *t = g_fake_q[i];
+    t->status = LIBUSB_TRANSFER_COMPLETED;
+    t->actual_length = t->length;
+    if (t->endpoint & 0x80)
+      for (int k = 0; k < t->length && k < 3; k++) t->buffer[k] = __atomic_load_n(&g_fake_in[k], __ATOMIC_SEQ_CST);
+    t->callback(t);
+  }
+  return 0;
+}
 void libusb_exit(libusb_context *c) { (void) c; }
 
 #endif

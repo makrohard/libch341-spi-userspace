@@ -10,10 +10,20 @@
  * Copyright (C) 2015 Urja Rannikko <urjaman@gmail.com>
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "libpinedio-usb.h"
+
+/* Test seam: a test defines PINEDIO_TEST_HOOK before including this file to hold or record a thread at a named
+ * point (tests/test_poll_worker.c). Empty otherwise. */
+#ifndef PINEDIO_TEST_HOOK
+#define PINEDIO_TEST_HOOK(name) do { } while (0)
+#endif
+
+#define PINEDIO_POLL_INTERVAL_NS (1000000000L / 30)
 
 #if 0
 #define pinedio_mutex_lock(...) { printf("Locking %s\n", __func__); pthread_mutex_lock(__VA_ARGS__); }
@@ -36,6 +46,31 @@
 #define CH341_CMD_UIO_STM_END 0x20
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
+/* Every call that takes the mutex is counted from before its lock to its last unlock, so deinit can wait until
+ * no caller is left before it destroys the mutex and the condvar. A call that finds the instance closing leaves
+ * at once (-1). Returns 0 with the mutex held. */
+static int api_enter(struct pinedio_inst *inst) {
+  __atomic_fetch_add(&inst->api_active, 1, __ATOMIC_SEQ_CST);
+  PINEDIO_TEST_HOOK(api_entered);
+  pthread_mutex_lock(&inst->usb_access_mutex);
+  if (inst->closing) {
+    __atomic_fetch_sub(&inst->api_active, 1, __ATOMIC_SEQ_CST);
+    pthread_cond_broadcast(&inst->poll_cond);
+    pthread_mutex_unlock(&inst->usb_access_mutex);
+    return -1;
+  }
+  return 0;
+}
+
+/* The caller's last access to the instance is this unlock. */
+static void api_exit(struct pinedio_inst *inst) {
+  PINEDIO_TEST_HOOK(api_exit);
+  __atomic_fetch_sub(&inst->api_active, 1, __ATOMIC_SEQ_CST);
+  if (inst->closing)
+    pthread_cond_broadcast(&inst->poll_cond);
+  pthread_mutex_unlock(&inst->usb_access_mutex);
+}
 
 // store mode and state of d0-d7
 uint16_t pinedio_d_mode = 0;
@@ -83,8 +118,8 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
 {
   int state_out = TRANS_IDLE;
 
-  if (lock) {
-    pinedio_mutex_lock(&inst->usb_access_mutex);
+  if (lock && api_enter(inst) != 0) {
+    return -1;   /* closing */
   }
 
   inst->transfer_out->buffer = (uint8_t*)writearr;
@@ -96,7 +131,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     state_out = TRANS_ACTIVE;
     int ret = libusb_submit_transfer(inst->transfer_out);
     if (ret) {
-      fprintf(stderr, "%s: failed to submit OUT transfer: %s\n", func, libusb_error_name(ret));
+      if (func) fprintf(stderr, "%s: failed to submit OUT transfer: %s\n", func, libusb_error_name(ret));
       state_out = TRANS_ERR;
       goto err;
     }
@@ -121,7 +156,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       int ret = libusb_submit_transfer(inst->transfer_ins[free_idx]);
       if (ret) {
         state_in[free_idx] = TRANS_ERR;
-        fprintf(stderr, "%s: failed to submit IN transfer: %s\n",
+        if (func) fprintf(stderr, "%s: failed to submit IN transfer: %s\n",
                  func, libusb_error_name(ret));
         goto err;
       }
@@ -157,12 +192,12 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   } while ((out_done < writecnt) || (in_done < readcnt));
 
   if (lock) {
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
+    api_exit(inst);
   }
   return 0;
 err:
   /* Clean up on errors. */
-  fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (state_out == TRANS_ERR) ? "write" : "read",
+  if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (state_out == TRANS_ERR) ? "write" : "read",
            (state_out == TRANS_ERR) ? writecnt : readcnt);
   /* First, we must cancel any ongoing requests and wait for them to be canceled. */
   if ((writecnt > 0) && (state_out == TRANS_ACTIVE)) {
@@ -195,7 +230,7 @@ err:
     libusb_handle_events_timeout(NULL, &(struct timeval){1, 0});
   }
   if (lock) {
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
+    api_exit(inst);
   }
   return -1;
 }
@@ -225,6 +260,8 @@ static void pinedio_port_path(libusb_device *device, char *out, size_t n) {
   }
 }
 
+static void *pinedio_poll_worker(void *arg);
+
 int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
   return pinedio_init_at_port(inst, driver, NULL);
 }
@@ -244,6 +281,21 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
     fprintf(stderr, "Failed to initialize mutex, res: %d.\n", ret);
     return -1;
   }
+  pthread_condattr_t cond_attr;
+  pthread_condattr_init(&cond_attr);
+  pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+  ret = pthread_cond_init(&inst->poll_cond, &cond_attr);
+  pthread_condattr_destroy(&cond_attr);
+  if (ret != 0) {
+    fprintf(stderr, "Failed to initialize condvar, res: %d.\n", ret);
+    pthread_mutex_destroy(&inst->usb_access_mutex);
+    return -1;
+  }
+  inst->worker_started = false;
+  inst->closing = false;
+  inst->api_active = 0;
+  inst->int_running_cnt = 0;
+  inst->in_error = false;
 
   ret = libusb_init(NULL);
   if (ret < 0) {
@@ -351,6 +403,13 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
 
   pinedio_set_cs(inst, false);
 
+  ret = pthread_create(&inst->pin_poll_thread, NULL, pinedio_poll_worker, inst);
+  if (ret != 0) {
+    fprintf(stderr, "Failed to create the poll thread, res: %d\n", ret);
+    ret = -1;
+    goto deinit_on_error;
+  }
+  inst->worker_started = true;
   return 0;
 
 deinit_on_error:
@@ -541,129 +600,159 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
   return (input & (1 << pin)) != 0 ? 1 : 0;
 }
 
-static void* pinedio_pin_poll_thread(void* arg) {
-  struct pinedio_inst *inst = arg;
-  int32_t ret = 0;
-  bool should_exit = false;
+/* The worker's read: the mutex is held by the caller (the worker). Quiet once in_error is set, so a gone device
+ * logs one failure, not one every poll. */
+static int32_t pinedio_poll_read(struct pinedio_inst *inst, uint32_t *input) {
+  uint8_t buf[] = {
+    0xA0,
+  };
+  uint8_t output[6] = {0};
 
-  uint32_t input;
-  while (!should_exit) {
-    ret = pinedio_get_input(inst, &input);
-    if (ret < 0) {
-      should_exit = true;
-      inst->in_error = true;
-      fprintf(stderr, "Failed to get input, res: %d\n", ret);
-      continue;
-    }
-    if (ret != 0) continue;
-    inst->in_error = false;
-    pinedio_mutex_lock(&inst->usb_access_mutex);
-    for (uint8_t int_pin = 0; int_pin < PINEDIO_INT_PIN_MAX; int_pin++) {
-      struct pinedio_inst_int* inst_int = &inst->interrupts[int_pin];
-      if (inst_int->callback == NULL) continue;
-      uint8_t state = (input & ( 1 << int_pin)) != 0;
-      if (inst_int->previous_state != 255 && inst_int->previous_state != state) {
-        enum pinedio_int_mode mode =
-                inst_int->previous_state == false && state == true ? PINEDIO_INT_MODE_RISING : PINEDIO_INT_MODE_FALLING;
-        if (inst_int->mode & mode) {
-          pinedio_mutex_unlock(&inst->usb_access_mutex);
-          inst_int->callback();
-          pinedio_mutex_lock(&inst->usb_access_mutex);
-        }
-      }
-      inst_int->previous_state = state;
-    }
-
-    should_exit = inst->pin_poll_thread_exit;
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
-    platform_sleep(1000 / 30);
-  }
+  PINEDIO_TEST_HOOK(in_read);
+  int32_t ret = usb_transfer(inst, inst->in_error ? NULL : "pinedio_poll_read", sizeof(buf), sizeof(output), buf,
+                             output, false);
+  *input = ((output[2] & 0x80) << 16) | ((output[1] & 0xef) << 8) | output[0];
+  return ret;
 }
 
+/* One worker per instance, from init to deinit. It polls while a pin is enabled, waits on poll_cond otherwise,
+ * and calls the callbacks it took under the mutex without it. A failed read sets in_error (sticky) and the
+ * worker keeps going; only deinit (closing) ends it. */
+static void *pinedio_poll_worker(void *arg) {
+  struct pinedio_inst *inst = arg;
+  void (*calls[PINEDIO_INT_PIN_MAX])(void);
+
+  pthread_mutex_lock(&inst->usb_access_mutex);
+  while (!inst->closing) {
+    if (inst->int_running_cnt == 0) {
+      pthread_cond_wait(&inst->poll_cond, &inst->usb_access_mutex);   /* nothing enabled */
+      continue;
+    }
+    uint32_t input;
+    int n = 0;
+    int32_t ret = pinedio_poll_read(inst, &input);
+    if (ret < 0) {
+      if (!inst->in_error)
+        fprintf(stderr, "Failed to get input, res: %d\n", ret);
+      inst->in_error = true;
+    } else {
+      for (uint8_t int_pin = 0; int_pin < PINEDIO_INT_PIN_MAX; int_pin++) {
+        struct pinedio_inst_int *inst_int = &inst->interrupts[int_pin];
+        if (inst_int->callback == NULL) continue;
+        uint8_t state = (input & (1 << int_pin)) != 0;
+        if (inst_int->previous_state != 255 && inst_int->previous_state != state) {
+          enum pinedio_int_mode mode =
+                  inst_int->previous_state == false && state == true ? PINEDIO_INT_MODE_RISING : PINEDIO_INT_MODE_FALLING;
+          if (inst_int->mode & mode)
+            calls[n++] = inst_int->callback;   /* the copy is called, never the field */
+        }
+        inst_int->previous_state = state;
+      }
+    }
+    if (n > 0) {
+      pthread_mutex_unlock(&inst->usb_access_mutex);
+      PINEDIO_TEST_HOOK(before_callbacks);
+      for (int i = 0; i < n; i++)
+        calls[i]();
+      pthread_mutex_lock(&inst->usb_access_mutex);
+      if (inst->closing)
+        break;
+    }
+    /* One absolute deadline per interval: a wakeup (spurious, or attach/detach) waits again for the same one. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_nsec += PINEDIO_POLL_INTERVAL_NS;
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_sec++;
+      deadline.tv_nsec -= 1000000000L;
+    }
+    while (!inst->closing && inst->int_running_cnt > 0) {
+      if (pthread_cond_timedwait(&inst->poll_cond, &inst->usb_access_mutex, &deadline) == ETIMEDOUT)
+        break;
+    }
+  }
+  pthread_mutex_unlock(&inst->usb_access_mutex);
+  PINEDIO_TEST_HOOK(worker_exit);
+  return NULL;
+}
+
+/* Enable a pin: mode and callback only. Never starts, stops or waits for a thread. */
 int32_t
 pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode,
                          void (*callback)(void)) {
-  int32_t res = 0;
   if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX) {
     return -1;
   }
-  pinedio_mutex_lock(&inst->usb_access_mutex);
-  if (inst->interrupts[int_pin].callback != NULL) {
-    inst->int_running_cnt--;
+  if (api_enter(inst) != 0) {
+    fprintf(stderr, "pinedio_attach_interrupt: instance is closing, refused\n");
+    return -1;
   }
+  if (inst->interrupts[int_pin].callback == NULL)
+    inst->int_running_cnt++;
   inst->interrupts[int_pin].previous_state = 255;
   inst->interrupts[int_pin].mode = int_mode;
   inst->interrupts[int_pin].callback = callback;
-  if (inst->int_running_cnt == 0) {
-    inst->pin_poll_thread_exit = false;
-    res = pthread_create(&inst->pin_poll_thread, NULL, pinedio_pin_poll_thread, inst);
-    if (res != 0) {
-      fprintf(stderr, "Failed to create thread, res: %d\n", res);
-      goto unlock;
-    }
-  }
-inst->int_running_cnt++;
-
-unlock:
-  pinedio_mutex_unlock(&inst->usb_access_mutex);
-  return res;
+  pthread_cond_broadcast(&inst->poll_cond);   /* an idle worker starts polling */
+  api_exit(inst);
+  return 0;
 }
 
+/* Disable a pin. -1 when it was not enabled or the instance is closing. */
 int32_t pinedio_deattach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin) {
   if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX) {
     return -1;
   }
-  pinedio_mutex_lock(&inst->usb_access_mutex);
-  int32_t res;
-  if (inst->int_running_cnt == 0 || inst->interrupts[int_pin].callback == NULL) {
-    res = -1;
-    goto unlock;
+  if (api_enter(inst) != 0) {
+    return -1;
   }
-  inst->interrupts[int_pin].callback = NULL;
-  inst->int_running_cnt--;
-  if (inst->int_running_cnt == 0) {
-    inst->pin_poll_thread_exit = true;
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
-    if (inst->pin_poll_thread != pthread_self())
-      pthread_join(inst->pin_poll_thread, NULL);
-    else
-      /* Called from within the poll thread itself (e.g. an interrupt
-       * callback detaching its own interrupt). We cannot join ourselves,
-       * but skipping reclamation entirely strands this thread's stack:
-       * nothing ever joins it, and the pthread_create() in the next
-       * pinedio_attach_interrupt() overwrites the only handle. Each
-       * strand permanently leaks the thread's ~8 MB stack mapping;
-       * callers that detach from the callback on every radio interrupt
-       * leak at interrupt rate (meshtastic/firmware#10468 — hundreds of
-       * GB of VSZ within days). Detaching ourselves instead lets glibc
-       * reclaim the stack when the thread exits. */
-      pthread_detach(pthread_self());
-    return 0;
+  int32_t res = -1;
+  if (inst->interrupts[int_pin].callback != NULL) {
+    inst->interrupts[int_pin].callback = NULL;
+    inst->int_running_cnt--;
+    res = 0;
   }
-unlock:
-  pinedio_mutex_unlock(&inst->usb_access_mutex);
+  pthread_cond_broadcast(&inst->poll_cond);
+  api_exit(inst);
   return res;
 }
 
 void pinedio_deinit(struct pinedio_inst *inst) {
-  pinedio_mutex_lock(&inst->usb_access_mutex);
-  if (inst->int_running_cnt != 0) {
-    inst->pin_poll_thread_exit = true;
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
-    pthread_join(inst->pin_poll_thread, NULL);
-  } else {
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
+  if (inst->worker_started && pthread_equal(pthread_self(), inst->pin_poll_thread)) {
+    fprintf(stderr, "pinedio_deinit: called from a poll callback, refused\n");
+    return;
   }
+  PINEDIO_TEST_HOOK(deinit_entered);
+  pthread_mutex_lock(&inst->usb_access_mutex);
+  inst->closing = true;
+  for (int i = 0; i < PINEDIO_INT_PIN_MAX; i++)
+    inst->interrupts[i].callback = NULL;
+  inst->int_running_cnt = 0;
+  pthread_cond_broadcast(&inst->poll_cond);
+  pthread_mutex_unlock(&inst->usb_access_mutex);
+
+  if (inst->worker_started) {
+    pthread_join(inst->pin_poll_thread, NULL);   /* the worker has terminated */
+    inst->worker_started = false;
+  }
+
+  /* Every counted caller has passed its last unlock before anything is freed or destroyed. */
+  pthread_mutex_lock(&inst->usb_access_mutex);
+  while (__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) > 0)
+    pthread_cond_wait(&inst->poll_cond, &inst->usb_access_mutex);
+  pthread_mutex_unlock(&inst->usb_access_mutex);
+  PINEDIO_TEST_HOOK(deinit_past_wait);
 
   for (int i = 0; i < USB_IN_TRANSFERS; i++) {
     if (inst->transfer_ins[i] != NULL) {
       libusb_free_transfer(inst->transfer_ins[i]);
+      inst->transfer_ins[i] = NULL;
     }
   }
   if (inst->transfer_out != NULL) {
     libusb_free_transfer(inst->transfer_out);
+    inst->transfer_out = NULL;
   }
-  
+
   if (inst->handle != NULL) {
     // We don't know if claim of interface was successful, but libusb handles this.
     libusb_release_interface(inst->handle, 0);
@@ -673,4 +762,6 @@ void pinedio_deinit(struct pinedio_inst *inst) {
     libusb_close(inst->handle);
     inst->handle = NULL;
   }
+  pthread_cond_destroy(&inst->poll_cond);
+  pthread_mutex_destroy(&inst->usb_access_mutex);
 }
