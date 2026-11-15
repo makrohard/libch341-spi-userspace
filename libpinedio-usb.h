@@ -66,7 +66,7 @@ struct pinedio_inst {
   pthread_mutex_t usb_access_mutex;  /* every USB transfer, the pin table and the fields below */
   pthread_t pin_poll_thread;         /* the poll worker: started by init, joined by deinit */
   bool pin_poll_thread_exit;         /* unused since the worker lives from init to deinit */
-  bool in_error;                     /* set by the first failed poll; stays set until deinit */
+  bool in_error;                     /* set by the first failed poll; stays set until deinit; read with __atomic_load_n */
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
   bool closing;                      /* deinit has begun: every later call is refused */
@@ -94,10 +94,14 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * detach only enable or disable a pin; they never start, stop or wait for a thread. A callback runs on the
  * worker without the library's mutex; it may attach and detach, it must not deinit (refused). A callback the
  * worker took before a detach may still run once after that detach returned; none runs after deinit returns.
- * After deinit has begun, attach is refused (-1). */
+ * After deinit has begun, every call is refused (-1). attach refuses a NULL callback. The owner must not start a
+ * call once it has started deinit: the library counts and waits for calls that have begun (from their first
+ * statement); a call that has not reached its first statement when deinit frees the instance is outside any
+ * library's reach. */
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
-void pinedio_deinit(struct pinedio_inst* inst);
+/* 0: closed, the instance may be freed. -1: refused (called from a poll callback): nothing released, do not free. */
+int32_t pinedio_deinit(struct pinedio_inst* inst);
 
 #ifdef __cplusplus
 }

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,7 +32,6 @@ static void hold_point(struct hold *h) {
   pthread_mutex_unlock(&g_m);
 }
 static void arm(struct hold *h) { pthread_mutex_lock(&g_m); memset(h, 0, sizeof(*h)); h->armed = 1; pthread_mutex_unlock(&g_m); }
-static void arm_for(struct hold *h, pthread_t t) { arm(h); pthread_mutex_lock(&g_m); h->only = t; h->only_set = 1; pthread_mutex_unlock(&g_m); }
 static void wait_arrived(struct hold *h) { pthread_mutex_lock(&g_m); while (!h->arrived) pthread_cond_wait(&g_c, &g_m); pthread_mutex_unlock(&g_m); }
 static void release(struct hold *h) { pthread_mutex_lock(&g_m); h->released = 1; pthread_cond_broadcast(&g_c); pthread_mutex_unlock(&g_m); }
 
@@ -61,14 +61,19 @@ static int wait_either(int a, int b) {
 static int polls(void) { pthread_mutex_lock(&g_m); int n = g_polls; pthread_mutex_unlock(&g_m); return n; }
 static void wait_polls(int target) { pthread_mutex_lock(&g_m); while (g_polls < target) pthread_cond_wait(&g_c, &g_m); pthread_mutex_unlock(&g_m); }
 static int is_deinit_thread(void) { return g_deinit_thread_set && pthread_equal(g_deinit_thread, pthread_self()); }
-static int is_d_thread(void) { return g_d_thread_set && pthread_equal(g_d_thread, pthread_self()); }
+static int is_d_thread(void) {
+  pthread_mutex_lock(&g_m);
+  int r = g_d_thread_set && pthread_equal(g_d_thread, pthread_self());
+  pthread_mutex_unlock(&g_m);
+  return r;
+}
 
 static void test_hook(const char *name) {
   if (!strcmp(name, "in_read")) {
     pthread_mutex_lock(&g_m); g_polls++; pthread_cond_broadcast(&g_c); pthread_mutex_unlock(&g_m);
     hold_point(&H_in_read);
   } else if (!strcmp(name, "before_callbacks")) hold_point(&H_before_cb);
-  else if (!strcmp(name, "api_entered")) hold_point(&H_api_entered);
+  else if (!strcmp(name, "api_entered")) { if (is_d_thread()) hold_point(&H_api_entered); }
   else if (!strcmp(name, "api_exit")) { if (is_d_thread()) event(EV_API_EXIT_D); }
   else if (!strcmp(name, "worker_exit")) event(EV_WORKER_EXIT);
   else if (!strcmp(name, "deinit_entered")) event(EV_DEINIT_ENTERED);
@@ -76,7 +81,7 @@ static void test_hook(const char *name) {
 }
 
 /* ---- wrappers for the library's pthread calls ---------------------------------------------------------------- */
-static int g_created, g_joined, g_fail_create, g_spurious;
+static int g_created, g_joined, g_fail_create, g_spurious, g_fail_cond_init, g_mutex_destroyed, g_cond_destroyed;
 static struct timespec g_deadlines[16];
 static int g_deadline_polls[16], g_ndeadlines;
 
@@ -92,6 +97,12 @@ static int w_join(pthread_t t, void **r) {
   event(EV_JOIN_RETURN);
   return rc;
 }
+static int w_cond_init(pthread_cond_t *c, const pthread_condattr_t *a) {
+  if (g_fail_cond_init) return ENOMEM;
+  return pthread_cond_init(c, a);
+}
+static int w_mutex_destroy(pthread_mutex_t *m) { g_mutex_destroyed++; return pthread_mutex_destroy(m); }
+static int w_cond_destroy(pthread_cond_t *c) { g_cond_destroyed++; return pthread_cond_destroy(c); }
 static int w_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
   if (is_deinit_thread()) event(EV_DEINIT_COND_WAIT);
   return pthread_cond_wait(c, m);
@@ -112,11 +123,17 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #define pthread_join w_join
 #define pthread_cond_wait w_cond_wait
 #define pthread_cond_timedwait w_cond_timedwait
+#define pthread_cond_init w_cond_init
+#define pthread_mutex_destroy w_mutex_destroy
+#define pthread_cond_destroy w_cond_destroy
 #include "../libpinedio-usb.c"
 #undef pthread_create
 #undef pthread_join
 #undef pthread_cond_wait
 #undef pthread_cond_timedwait
+#undef pthread_cond_init
+#undef pthread_mutex_destroy
+#undef pthread_cond_destroy
 #include "fake_helpers.h"
 
 /* ---- fixtures ------------------------------------------------------------------------------------------------ */
@@ -183,7 +200,10 @@ static void s0(void) {
     assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, cb_a) == 0);
   int alive = live_threads();
   pinedio_deinit(inst);
-  int after = live_threads();
+  /* A joined thread can still be listed for a moment after pthread_join returns (the kernel reaps it after it
+   * wakes the joiner): spin until it is gone; the child's alarm bounds it. */
+  int after;
+  while ((after = live_threads()) > 1) sched_yield();
   printf("     S0: threads after 10 re-attaches %d, after deinit %d\n", alive, after);
   fflush(stdout);
   assert(alive == 2 && after == 1);
@@ -206,22 +226,26 @@ static void s1(void) {
   assert(g_joined == 1);
 }
 
-/* S2: attach and detach while the worker is inside a poll: both wait for the mutex, then take effect. */
+/* S2: attach and detach while the worker is inside a poll (it holds the mutex in its read): each call waits
+ * for the mutex and then takes effect. The order is forced: attach B in one held poll, detach A in the next. */
 static void *attach_b(void *arg) { return (void *) (intptr_t) pinedio_attach_interrupt(arg, PINEDIO_PIN_D1, PINEDIO_INT_MODE_RISING, cb_b); }
 static void *detach_a(void *arg) { return (void *) (intptr_t) pinedio_deattach_interrupt(arg, PINEDIO_PIN_D0); }
+static void during_held_poll(struct pinedio_inst *inst, void *(*fn)(void *)) {
+  arm(&H_in_read);
+  wait_arrived(&H_in_read);
+  pthread_t t;
+  void *r;
+  assert(pthread_create(&t, NULL, fn, inst) == 0);
+  release(&H_in_read);
+  pthread_join(t, &r);
+  assert((intptr_t) r == 0);
+}
 static void s2(void) {
   struct pinedio_inst *inst = open_inst();
   attach_d0(inst, cb_a);
-  arm(&H_in_read);
-  wait_arrived(&H_in_read);                       /* the worker holds the mutex in its read */
-  pthread_t tb, ta;
-  assert(pthread_create(&tb, NULL, attach_b, inst) == 0);
-  assert(pthread_create(&ta, NULL, detach_a, inst) == 0);
-  release(&H_in_read);
-  void *rb, *ra;
-  pthread_join(tb, &rb);
-  pthread_join(ta, &ra);
-  assert((intptr_t) rb == 0 && (intptr_t) ra == 0);
+  during_held_poll(inst, attach_b);
+  during_held_poll(inst, detach_a);
+  assert(inst->int_running_cnt == 1 && inst->interrupts[PINEDIO_PIN_D0].callback == NULL);
   int p = polls();
   wait_polls(p + 2);                              /* D1's previous state is set */
   set_input(0x03);                                /* D0 and D1 rise */
@@ -249,19 +273,60 @@ static void s3(void) {
   free(inst);
 }
 
+/* S3b, through the public path (a callback is the caller's own code; no library hook): 10 re-attaches, an edge,
+ * the callback that receives it blocks; deinit starts. When deinit enters its join, this process must hold
+ * exactly main, the deinit thread and one worker. On 98b656bf the 10 re-attaches left 10 poll threads (12 in
+ * all), whichever of them got the edge. */
+static struct hold H_cb;
+static void cb_hold(void) { hold_point(&H_cb); }
+static void s3b(void) {
+  devices(1);
+  g_fake_io_ok = 1;
+  struct pinedio_inst *inst = calloc(1, sizeof(*inst));
+  *inst = fresh(NULL);
+  assert(pinedio_init(inst, NULL) == 0);
+  for (int k = 0; k < 10; k++)
+    assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING | PINEDIO_INT_MODE_FALLING, cb_hold) == 0);
+  arm(&H_cb);
+  for (uint8_t v = 1; ; v ^= 1) {                 /* toggle until a poller has taken an edge (no sleep) */
+    set_input(v);
+    pthread_mutex_lock(&g_m); int got = H_cb.arrived; pthread_mutex_unlock(&g_m);
+    if (got) break;
+    sched_yield();
+  }
+  pthread_t h = start_deinit(inst);
+  wait_event(EV_JOIN_ENTER);
+  int during = live_threads();
+  printf("     S3b: threads while deinit joins %d\n", during);
+  fflush(stdout);
+  assert(during == 3);
+  release(&H_cb);
+  pthread_join(h, NULL);
+  int after;
+  while ((after = live_threads()) > 1) sched_yield();
+  free(inst);
+}
+
 /* S4: deinit with the worker waiting: (a) idle, no pin; (b) in its interval wait, one pin. */
 static void s4a(void) { struct pinedio_inst *inst = open_inst(); close_inst(inst); assert(g_joined == 1 && ev_n(EV_WORKER_EXIT) == 1); }
-static void s4b(void) {
-  struct pinedio_inst *inst = open_inst();
-  attach_d0(inst, cb_a);
-  close_inst(inst);
-  assert(g_joined == 1 && ev_n(EV_WORKER_EXIT) == 1);
+static void s4b(void) {                          /* public path: no hook wait */
+  devices(1);
+  g_fake_io_ok = 1;
+  struct pinedio_inst *inst = calloc(1, sizeof(*inst));
+  *inst = fresh(NULL);
+  assert(pinedio_init(inst, NULL) == 0);
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, cb_a) == 0);
+  assert(pinedio_deinit(inst) == 0 && g_joined == 1);
+  int after;
+  while ((after = live_threads()) > 1) sched_yield();
+  free(inst);
 }
 
 /* S5: deinit with an API caller between its count and its lock: deinit must wait for it before it frees or
  * destroys anything. */
 static int g_d_rc = 99;
 static void *d_thread(void *arg) {
+  pthread_mutex_lock(&g_m); g_d_thread = pthread_self(); g_d_thread_set = 1; pthread_mutex_unlock(&g_m);
   uint8_t buf[4] = {0};
   g_d_rc = pinedio_transceive(arg, buf, buf, sizeof(buf));
   return NULL;
@@ -275,11 +340,8 @@ static void s5(void) {
   pthread_t h = start_deinit(inst);
   wait_event(EV_JOIN_ENTER);                      /* closing is set, deinit waits for the worker */
   pthread_t d;
-  pthread_mutex_lock(&g_m);
+  arm(&H_api_entered);                            /* held only for D (it registers itself first) */
   assert(pthread_create(&d, NULL, d_thread, inst) == 0);
-  g_d_thread = d; g_d_thread_set = 1;
-  pthread_mutex_unlock(&g_m);
-  arm_for(&H_api_entered, d);
   wait_arrived(&H_api_entered);                   /* D is counted, not yet locked */
   release(&H_before_cb);                          /* the worker calls cb_a, sees closing, exits */
   int first = wait_either(EV_DEINIT_COND_WAIT, EV_DEINIT_PAST_WAIT);
@@ -350,10 +412,39 @@ static void s8(void) {
   dup2(saved, 2);
   rewind(log);
   char line[256];
-  int failed_lines = 0;
-  while (fgets(line, sizeof(line), log))
+  int failed_lines = 0, lines = 0;
+  while (fgets(line, sizeof(line), log)) {
+    lines++;
     if (strstr(line, "Failed to get input")) failed_lines++;
-  assert(failed_lines == 1);
+  }
+  printf("     S8: %d stderr lines over 7+ failing polls\n", lines);
+  fflush(stdout);
+  assert(failed_lines == 1 && lines <= 3);        /* the first failure's lines only, however many polls */
+  close_inst(inst);
+}
+
+/* S8b: transfers that are submitted but complete with an error (the transfer callbacks log): bounded too. */
+static void s8b(void) {
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_a);
+  fflush(stderr);
+  FILE *log = tmpfile();
+  int saved = dup(2);
+  dup2(fileno(log), 2);
+  __atomic_store_n(&g_fake_fail_status, 1, __ATOMIC_SEQ_CST);
+  int p = polls();
+  wait_polls(p + 8);
+  assert(__atomic_load_n(&inst->in_error, __ATOMIC_SEQ_CST));
+  fflush(stderr);
+  dup2(saved, 2);
+  rewind(log);
+  char line[256];
+  int lines = 0;
+  while (fgets(line, sizeof(line), log)) lines++;
+  printf("     S8b: %d stderr lines over 8 failing polls\n", lines);
+  fflush(stdout);
+  assert(lines <= 4);
+  __atomic_store_n(&g_fake_fail_status, 0, __ATOMIC_SEQ_CST);
   close_inst(inst);
 }
 
@@ -379,27 +470,90 @@ static void s9(void) {
 }
 
 /* S10: deinit from a callback is refused and frees nothing; deinit from the main thread then frees once. */
-static void cb_deinit(void) { pinedio_deinit(g_inst); }
+static int g_wrapper_freed, g_deinit_rc = 99;
+static void cb_deinit(void) {                    /* a wrapper's close, as ch341_adapter.c's: free only on 0 */
+  g_deinit_rc = pinedio_deinit(g_inst);
+  if (g_deinit_rc == 0) g_wrapper_freed = 1;
+}
 static void s10(void) {
   struct pinedio_inst *inst = open_inst();
   attach_d0(inst, cb_deinit);
   set_input(0x01);
   int p = polls();
   wait_polls(p + 2);
-  assert(g_fake_freed == 0 && g_devs[0].closed == 0);
+  assert(g_deinit_rc == -1 && g_wrapper_freed == 0 && g_fake_freed == 0 && g_devs[0].closed == 0);
   close_inst(inst);
   assert(g_fake_freed == USB_IN_TRANSFERS + 1 && g_devs[0].closed == 1 && g_joined == 1);
 }
 
-/* S11: the worker cannot start: init fails, nothing to join, the device is given back. */
-static void s11(void) {
-  devices(1);
-  g_fake_io_ok = 1;
-  g_fail_create = 1;
+/* S11: every init failure after the mutex exists gives the mutex and condvar back, starts and joins nothing,
+ * and returns the code the adapter expects (-1: no libusb reference taken; -2/-3: taken). */
+static void init_fails(int expect_rc, int expect_mutex, int expect_cond) {
   struct pinedio_inst *inst = calloc(1, sizeof(*inst));
   *inst = fresh(NULL);
-  assert(pinedio_init(inst, NULL) != 0);
-  assert(g_created == 0 && g_joined == 0 && g_devs[0].closed == 1 && g_fake_freed == USB_IN_TRANSFERS + 1);
+  assert(pinedio_init(inst, NULL) == expect_rc);
+  assert(g_created == 0 && g_joined == 0);
+  assert(g_mutex_destroyed == expect_mutex && g_cond_destroyed == expect_cond);
+  free(inst);
+}
+static void s11a(void) { devices(1); g_fake_io_ok = 1; g_fake_init_rc = LIBUSB_ERROR_OTHER; init_fails(-1, 1, 1); }
+static void s11b(void) { devices(0); g_fake_io_ok = 1; init_fails(-2, 1, 1); }
+static void s11c(void) { devices(1); g_fake_io_ok = 1; g_fail_cond_init = 1; init_fails(-1, 1, 0); }   /* no condvar to destroy */
+static void s11d(void) {
+  devices(1); g_fake_io_ok = 1; g_fail_create = 1;
+  init_fails(-3, 1, 1);
+  assert(g_devs[0].closed == 1 && g_fake_freed == USB_IN_TRANSFERS + 1);
+}
+
+/* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
+static void s12(void) {
+  struct pinedio_inst *inst = open_inst();
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D1, PINEDIO_INT_MODE_RISING, NULL) == -1 && inst->int_running_cnt == 0);
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, cb_a) == 0 && inst->int_running_cnt == 1);
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, NULL) == -1);
+  assert(inst->int_running_cnt == 1 && inst->interrupts[PINEDIO_PIN_D0].callback == cb_a);
+  close_inst(inst);
+}
+
+/* S13a: a public call whose first statement runs after deinit set CLOSING is refused before any device access.
+ * S13b: a call already inside its transfer when deinit starts finishes first; deinit frees only after its exit. */
+static void s13a(void) {
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_a);
+  arm(&H_before_cb);
+  set_input(0x01);
+  wait_arrived(&H_before_cb);                     /* the worker is in a callback: deinit will wait in its join */
+  pthread_t h = start_deinit(inst);
+  wait_event(EV_JOIN_ENTER);
+  int submits = g_fake_submits;
+  uint8_t b[4] = {0};
+  assert(pinedio_get_irq_state(inst, PINEDIO_PIN_D0) == -1);
+  assert(pinedio_transceive(inst, b, b, sizeof(b)) == -1);
+  assert(pinedio_digital_write(inst, 1, true) == -1);
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D1, PINEDIO_INT_MODE_RISING, cb_b) == -1);
+  assert(g_fake_submits == submits);
+  release(&H_before_cb);
+  pthread_join(h, NULL);
+  memset(inst, 0xA5, sizeof(*inst));
+  free(inst);
+}
+static struct hold H_events;
+static void on_events(void) { if (is_d_thread()) hold_point(&H_events); }
+static void s13b(void) {
+  struct pinedio_inst *inst = open_inst();
+  pthread_t d;
+  arm(&H_events);
+  g_fake_on_events = on_events;
+  assert(pthread_create(&d, NULL, d_thread, inst) == 0);
+  wait_arrived(&H_events);                        /* D holds the mutex inside its transfer */
+  pthread_t h = start_deinit(inst);
+  wait_event(EV_DEINIT_ENTERED);
+  release(&H_events);
+  pthread_join(d, NULL);
+  pthread_join(h, NULL);
+  assert(g_d_rc == 0);
+  assert(g_ev_seq[EV_API_EXIT_D] < g_ev_seq[EV_DEINIT_PAST_WAIT]);
+  memset(inst, 0xA5, sizeof(*inst));
   free(inst);
 }
 
@@ -432,7 +586,13 @@ int main(int argc, char **argv) {
     {"S5 deinit waits for a counted caller", s5}, {"S6 callback attach during CLOSING refused", s6},
     {"S7 callback self-detach and re-attach", s7}, {"S8 read failure: sticky in_error, one line", s8},
     {"S9 spurious wakeups keep the deadline", s9}, {"S10 deinit from a callback refused", s10},
-    {"S11 worker cannot start: init fails", s11},
+    {"S3b public path: one worker while deinit joins", s3b},
+    {"S8b transfer errors: bounded log", s8b},
+    {"S11a init: libusb_init fails", s11a}, {"S11b init: no device", s11b},
+    {"S11c init: condvar init fails", s11c}, {"S11d init: worker cannot start", s11d},
+    {"S12 NULL callback refused, count untouched", s12},
+    {"S13a a call after CLOSING is refused, no device access", s13a},
+    {"S13b a call inside its transfer finishes before the free", s13b},
   };
   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     if (argc > 1 && strncmp(cases[i].n, argv[1], strlen(argv[1])) != 0) continue;

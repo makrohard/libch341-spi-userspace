@@ -26,7 +26,8 @@ static struct libusb_device g_dev_objs[4];
 static struct libusb_device_handle g_handles[4];
 static libusb_device *g_list[5];
 
-int libusb_init(libusb_context **c) { (void) c; return 0; }
+static int g_fake_init_rc;              /* libusb_init's result */
+int libusb_init(libusb_context **c) { (void) c; return g_fake_init_rc; }
 int libusb_set_option(libusb_context *c, enum libusb_option o, ...) { (void) c; (void) o; return 0; }
 ssize_t libusb_get_device_list(libusb_context *c, libusb_device ***list) {
   (void) c;
@@ -90,6 +91,9 @@ static int g_fake_io_ok;
 static int g_fake_fail;                 /* atomic: set by the test while the worker polls */
 static uint8_t g_fake_in[3];            /* atomic bytes: the input word the next IN transfer returns */
 static int g_fake_freed;                /* transfers freed */
+static int g_fake_submits;              /* submits that reached the device */
+static int g_fake_fail_status;          /* atomic: queued transfers complete with LIBUSB_TRANSFER_NO_DEVICE */
+static void (*g_fake_on_events)(void);  /* called at the start of every handle_events (a test hold point) */
 static struct libusb_transfer *g_fake_q[2 * 8 + 2];
 static int g_fake_nq;
 struct libusb_transfer *libusb_alloc_transfer(int n) {
@@ -103,17 +107,20 @@ void libusb_free_transfer(struct libusb_transfer *t) {
 }
 int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
+  __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);
   g_fake_q[g_fake_nq++] = t;
   return 0;
 }
 int libusb_cancel_transfer(struct libusb_transfer *t) { (void) t; return 0; }
 int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
   (void) c; (void) tv;
+  if (g_fake_on_events) g_fake_on_events();
   int n = g_fake_nq;
   g_fake_nq = 0;
   for (int i = 0; i < n; i++) {
     struct libusb_transfer *t = g_fake_q[i];
-    t->status = LIBUSB_TRANSFER_COMPLETED;
+    t->status = __atomic_load_n(&g_fake_fail_status, __ATOMIC_SEQ_CST) ? LIBUSB_TRANSFER_NO_DEVICE
+                                                                       : LIBUSB_TRANSFER_COMPLETED;
     t->actual_length = t->length;
     if (t->endpoint & 0x80)
       for (int k = 0; k < t->length && k < 3; k++) t->buffer[k] = __atomic_load_n(&g_fake_in[k], __ATOMIC_SEQ_CST);

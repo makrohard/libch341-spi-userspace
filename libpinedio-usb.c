@@ -55,6 +55,7 @@ static int api_enter(struct pinedio_inst *inst) {
   PINEDIO_TEST_HOOK(api_entered);
   pthread_mutex_lock(&inst->usb_access_mutex);
   if (inst->closing) {
+    PINEDIO_TEST_HOOK(api_exit);
     __atomic_fetch_sub(&inst->api_active, 1, __ATOMIC_SEQ_CST);
     pthread_cond_broadcast(&inst->poll_cond);
     pthread_mutex_unlock(&inst->usb_access_mutex);
@@ -72,19 +73,24 @@ static void api_exit(struct pinedio_inst *inst) {
   pthread_mutex_unlock(&inst->usb_access_mutex);
 }
 
+/* A public device call: counted from its first statement, the whole operation under the mutex, refused (-1)
+ * once the instance is closing. */
+#define PINEDIO_API(inst, call) do {          \
+    if (api_enter(inst) != 0) return -1;      \
+    int32_t api_ret_ = (call);                \
+    api_exit(inst);                           \
+    return api_ret_;                          \
+  } while (0)
+
 // store mode and state of d0-d7
 uint16_t pinedio_d_mode = 0;
 uint16_t pinedio_d_state = 0;
 
 enum trans_state {TRANS_ACTIVE = -2, TRANS_ERR = -1, TRANS_IDLE = 0};
 
-static void platform_sleep(uint32_t msecs) {
-#ifdef __WIN32
-  Sleep(msecs);
-#else
-  usleep(msecs * 1000);
-#endif
-}
+/* Set while the poll worker reads with in_error already set: the transfer callbacks run inside this thread's
+ * libusb_handle_events_timeout, so a gone device logs its first failure, not one per poll. */
+static __thread bool t_quiet;
 
 static void cb_common(const char* func, struct libusb_transfer *transfer) {
   int* transfer_cnt = (int *) transfer->user_data;
@@ -96,7 +102,7 @@ static void cb_common(const char* func, struct libusb_transfer *transfer) {
   }
 
   if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
-    fprintf(stderr, "%s: error: %s\n", func, libusb_error_name(transfer->status));
+    if (!t_quiet) fprintf(stderr, "%s: error: %s\n", func, libusb_error_name(transfer->status));
     *transfer_cnt = TRANS_ERR;
   } else {
     *transfer_cnt = transfer->actual_length;
@@ -113,14 +119,12 @@ static void LIBUSB_CALL cb_in(struct libusb_transfer *transfer) {
   cb_common(__func__, transfer);
 }
 
+/* The caller holds usb_access_mutex (a public call through PINEDIO_API, or the poll worker). func NULL: quiet. */
 static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigned int writecnt, unsigned int readcnt,
-                            const uint8_t *writearr, uint8_t *readarr, bool lock)
+                            const uint8_t *writearr, uint8_t *readarr)
 {
   int state_out = TRANS_IDLE;
-
-  if (lock && api_enter(inst) != 0) {
-    return -1;   /* closing */
-  }
+  t_quiet = func == NULL;
 
   inst->transfer_out->buffer = (uint8_t*)writearr;
   inst->transfer_out->length = writecnt;
@@ -191,9 +195,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     }
   } while ((out_done < writecnt) || (in_done < readcnt));
 
-  if (lock) {
-    api_exit(inst);
-  }
+  t_quiet = false;
   return 0;
 err:
   /* Clean up on errors. */
@@ -229,9 +231,7 @@ err:
       break;
     libusb_handle_events_timeout(NULL, &(struct timeval){1, 0});
   }
-  if (lock) {
-    api_exit(inst);
-  }
+  t_quiet = false;
   return -1;
 }
 
@@ -258,6 +258,12 @@ static void pinedio_port_path(libusb_device *device, char *out, size_t n) {
   if (len >= n) {
     out[0] = '\0';
   }
+}
+
+/* init's early returns after the mutex and condvar exist (no worker, no transfers yet). */
+static void sync_destroy(struct pinedio_inst *inst) {
+  pthread_cond_destroy(&inst->poll_cond);
+  pthread_mutex_destroy(&inst->usb_access_mutex);
 }
 
 static void *pinedio_poll_worker(void *arg);
@@ -295,11 +301,12 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   inst->closing = false;
   inst->api_active = 0;
   inst->int_running_cnt = 0;
-  inst->in_error = false;
+  __atomic_store_n(&inst->in_error, false, __ATOMIC_SEQ_CST);
 
   ret = libusb_init(NULL);
   if (ret < 0) {
     fprintf(stderr, "Couldn't initialize libusb!\n");
+    sync_destroy(inst);
     return -1;
   }
 
@@ -373,6 +380,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   if (inst->handle == NULL) {
     // TODO: Rework this so we can receive error and print it.
     fprintf(stderr, "Couldn't open LoRa USB device.\n");
+    sync_destroy(inst);
     return -2;
   }
 
@@ -406,7 +414,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   ret = pthread_create(&inst->pin_poll_thread, NULL, pinedio_poll_worker, inst);
   if (ret != 0) {
     fprintf(stderr, "Failed to create the poll thread, res: %d\n", ret);
-    ret = -1;
+    ret = -3;   /* the libusb reference was taken, as with -2 and 0 */
     goto deinit_on_error;
   }
   inst->worker_started = true;
@@ -421,7 +429,7 @@ int32_t pinedio_set_option(struct pinedio_inst *inst, enum pinedio_option option
   inst->options[option] = value;
 }
 
-int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t mode) {
+static int32_t set_pin_mode_locked(struct pinedio_inst *inst, uint32_t pin, uint32_t mode) {
     if (mode == 1) { // output
     pinedio_d_mode |= (1 << pin);
   } else {
@@ -433,14 +441,19 @@ int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t m
           CH341_CMD_UIO_STM_END
   };
 
-  int32_t ret = 0; //usb_transfer(inst, __func__, sizeof(buf), 0, buf, NULL, true);
+  (void) buf;
+  int32_t ret = 0; //usb_transfer(inst, __func__, sizeof(buf), 0, buf, NULL);
   if (ret < 0) {
     printf("Failed to set CS pin.\n");
   }
   return ret;
 }
 
-int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool active) {
+int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t mode) {
+  PINEDIO_API(inst, set_pin_mode_locked(inst, pin, mode));
+}
+
+static int32_t digital_write_locked(struct pinedio_inst *inst, uint32_t pin, bool active) {
   if (active) {
     pinedio_d_state |= (1 << pin);
   } else {
@@ -453,7 +466,7 @@ int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool acti
           CH341_CMD_UIO_STM_END
   };
 
-  int32_t ret = usb_transfer(inst, __func__, sizeof(buf), 0, buf, NULL, true);
+  int32_t ret = usb_transfer(inst, "pinedio_digital_write", sizeof(buf), 0, buf, NULL);
   if (ret < 0) {
     printf("Failed to set CS pin.\n");
   }
@@ -461,12 +474,15 @@ int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool acti
 
 }
 
-int32_t pinedio_set_cs(struct pinedio_inst *inst, bool active) {
-  return pinedio_digital_write(inst, 0, active);
-  
+int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool active) {
+  PINEDIO_API(inst, digital_write_locked(inst, pin, active));
 }
 
-int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt) {
+int32_t pinedio_set_cs(struct pinedio_inst *inst, bool active) {
+  PINEDIO_API(inst, digital_write_locked(inst, 0, active));
+}
+
+static int32_t write_read_locked(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt) {
   /* How many packets ... */
   const size_t packets = (writecnt + readcnt + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
 
@@ -481,7 +497,7 @@ int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_
    * Final transition to deselected state is in the pin disable. */
 //  pluck_cs(ptr, &data->stored_delay_us);
   if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    pinedio_set_cs(inst, true);
+    digital_write_locked(inst, 0, true);
   }
   unsigned int write_left = writecnt;
   unsigned int read_left = readcnt;
@@ -501,10 +517,10 @@ int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_
     write_left -= write_now;
   }
 
-  int32_t ret = usb_transfer(inst, __func__, packets + writecnt + readcnt,
-                             writecnt + readcnt, wbuf, rbuf, true);
+  int32_t ret = usb_transfer(inst, "pinedio_write_read", packets + writecnt + readcnt,
+                             writecnt + readcnt, wbuf, rbuf);
   if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    pinedio_set_cs(inst, false);
+    digital_write_locked(inst, 0, false);
   }
   if (ret < 0)
     return -1;
@@ -517,7 +533,11 @@ int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_
   return 0;
 }
 
-int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count) {
+int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt) {
+  PINEDIO_API(inst, write_read_locked(inst, writearr, writecnt, readarr, readcnt));
+}
+
+static int32_t transceive_locked(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count) {
   const size_t packets = (count + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
 
   uint8_t wbuf[packets*CH341_PACKET_LENGTH];
@@ -525,7 +545,7 @@ int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_
 
   uint8_t *ptr = wbuf;
   if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    pinedio_set_cs(inst, true);
+    digital_write_locked(inst, 0, true);
   }
   unsigned int write_left = count;
   unsigned int read_left = count;
@@ -545,10 +565,10 @@ int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_
     write_left -= write_now;
   }
 
-  int32_t ret = usb_transfer(inst, __func__, packets + count,
-                             count, wbuf, read_buf, true);
+  int32_t ret = usb_transfer(inst, "pinedio_transceive", packets + count,
+                             count, wbuf, read_buf);
   if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    pinedio_set_cs(inst, false);
+    digital_write_locked(inst, 0, false);
   }
   if (ret < 0)
     return -1;
@@ -561,13 +581,17 @@ int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_
   return 0;
 }
 
-int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin) {
+int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count) {
+  PINEDIO_API(inst, transceive_locked(inst, write_buf, read_buf, count));
+}
+
+static int32_t digital_read_locked(struct pinedio_inst *inst, uint32_t pin) {
   uint8_t buf[] = {
     0xA0,
   };
   uint8_t output[6];
 
-  int32_t ret = usb_transfer(inst, __func__, sizeof(buf), sizeof(output), buf, output, true);
+  int32_t ret = usb_transfer(inst, "pinedio_digital_read", sizeof(buf), sizeof(output), buf, output);
   if (ret < 0) {
     fprintf(stderr, "Could not get input pins.\n");
     return ret;
@@ -576,14 +600,18 @@ int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin) {
   return output[0] & 1 << pin; // maybe?
 }
 
+int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin) {
+  PINEDIO_API(inst, digital_read_locked(inst, pin));
+}
+
 static int32_t pinedio_get_input(struct pinedio_inst *inst, uint32_t* input)
 {
   uint8_t buf[] = {
     0xA0,
   };
-  uint8_t output[6];
+  uint8_t output[6] = {0};
 
-  int32_t ret = usb_transfer(inst, __func__, sizeof(buf), sizeof(output), buf, output, true);
+  int32_t ret = usb_transfer(inst, "pinedio_get_input", sizeof(buf), sizeof(output), buf, output);
   if (ret < 0) {
     fprintf(stderr, "Could not get input pins.\n");
   }
@@ -591,13 +619,17 @@ static int32_t pinedio_get_input(struct pinedio_inst *inst, uint32_t* input)
   return ret;
 }
 
-int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
+static int32_t get_irq_state_locked(struct pinedio_inst *inst, uint32_t pin) {
   uint32_t input;
   int32_t ret = pinedio_get_input(inst, &input);
   if (ret != 0) {
     return ret;
   }
   return (input & (1 << pin)) != 0 ? 1 : 0;
+}
+
+int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
+  PINEDIO_API(inst, get_irq_state_locked(inst, pin));
 }
 
 /* The worker's read: the mutex is held by the caller (the worker). Quiet once in_error is set, so a gone device
@@ -609,8 +641,8 @@ static int32_t pinedio_poll_read(struct pinedio_inst *inst, uint32_t *input) {
   uint8_t output[6] = {0};
 
   PINEDIO_TEST_HOOK(in_read);
-  int32_t ret = usb_transfer(inst, inst->in_error ? NULL : "pinedio_poll_read", sizeof(buf), sizeof(output), buf,
-                             output, false);
+  int32_t ret = usb_transfer(inst, __atomic_load_n(&inst->in_error, __ATOMIC_SEQ_CST) ? NULL : "pinedio_poll_read",
+                             sizeof(buf), sizeof(output), buf, output);
   *input = ((output[2] & 0x80) << 16) | ((output[1] & 0xef) << 8) | output[0];
   return ret;
 }
@@ -632,9 +664,9 @@ static void *pinedio_poll_worker(void *arg) {
     int n = 0;
     int32_t ret = pinedio_poll_read(inst, &input);
     if (ret < 0) {
-      if (!inst->in_error)
+      if (!__atomic_load_n(&inst->in_error, __ATOMIC_SEQ_CST))
         fprintf(stderr, "Failed to get input, res: %d\n", ret);
-      inst->in_error = true;
+      __atomic_store_n(&inst->in_error, true, __ATOMIC_SEQ_CST);   /* read by callers without the mutex */
     } else {
       for (uint8_t int_pin = 0; int_pin < PINEDIO_INT_PIN_MAX; int_pin++) {
         struct pinedio_inst_int *inst_int = &inst->interrupts[int_pin];
@@ -680,8 +712,8 @@ static void *pinedio_poll_worker(void *arg) {
 int32_t
 pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode,
                          void (*callback)(void)) {
-  if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX) {
-    return -1;
+  if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX || callback == NULL) {
+    return -1;   /* a NULL callback would enable nothing: detach disables a pin */
   }
   if (api_enter(inst) != 0) {
     fprintf(stderr, "pinedio_attach_interrupt: instance is closing, refused\n");
@@ -716,10 +748,12 @@ int32_t pinedio_deattach_interrupt(struct pinedio_inst *inst, enum pinedio_int_p
   return res;
 }
 
-void pinedio_deinit(struct pinedio_inst *inst) {
+/* 0: closed, the instance may be freed. -1: refused (called from a poll callback); nothing was released and the
+ * caller must not free the instance. */
+int32_t pinedio_deinit(struct pinedio_inst *inst) {
   if (inst->worker_started && pthread_equal(pthread_self(), inst->pin_poll_thread)) {
     fprintf(stderr, "pinedio_deinit: called from a poll callback, refused\n");
-    return;
+    return -1;
   }
   PINEDIO_TEST_HOOK(deinit_entered);
   pthread_mutex_lock(&inst->usb_access_mutex);
@@ -764,4 +798,5 @@ void pinedio_deinit(struct pinedio_inst *inst) {
   }
   pthread_cond_destroy(&inst->poll_cond);
   pthread_mutex_destroy(&inst->usb_access_mutex);
+  return 0;
 }
