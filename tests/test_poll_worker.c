@@ -37,10 +37,12 @@ static void release(struct hold *h) { pthread_mutex_lock(&g_m); h->released = 1;
 
 /* named events: the sequence number of the first occurrence, and counts */
 enum { EV_WORKER_EXIT, EV_DEINIT_ENTERED, EV_JOIN_ENTER, EV_JOIN_RETURN, EV_DEINIT_COND_WAIT, EV_DEINIT_PAST_WAIT,
-       EV_API_EXIT_D, EV_CB_A, EV_CB_B, EV_MAX };
+       EV_API_EXIT_D, EV_CB_A, EV_CB_B, EV_API_ENTERED, EV_PIN_LOCK_TB, EV_PIN_HELD_TB, EV_TA_RELEASED, EV_MAX };
 static int g_ev_seq[EV_MAX], g_ev_n[EV_MAX], g_polls;
-static pthread_t g_deinit_thread, g_d_thread;
-static int g_deinit_thread_set, g_d_thread_set;
+static pthread_t g_deinit_thread, g_d_thread, g_ta_thread, g_tb_thread;
+static int g_deinit_thread_set, g_d_thread_set, g_ta_set, g_tb_set;
+static void *g_watch_mutex;             /* the library's pin-state mutex, set after the include */
+static struct hold H_pin;
 
 static void event(int e) {
   pthread_mutex_lock(&g_m);
@@ -60,7 +62,18 @@ static int wait_either(int a, int b) {
 }
 static int polls(void) { pthread_mutex_lock(&g_m); int n = g_polls; pthread_mutex_unlock(&g_m); return n; }
 static void wait_polls(int target) { pthread_mutex_lock(&g_m); while (g_polls < target) pthread_cond_wait(&g_c, &g_m); pthread_mutex_unlock(&g_m); }
-static int is_deinit_thread(void) { return g_deinit_thread_set && pthread_equal(g_deinit_thread, pthread_self()); }
+static int is_thread(pthread_t *t, int *set) {
+  pthread_mutex_lock(&g_m);
+  int r = *set && pthread_equal(*t, pthread_self());
+  pthread_mutex_unlock(&g_m);
+  return r;
+}
+static int is_deinit_thread(void) { return is_thread(&g_deinit_thread, &g_deinit_thread_set); }
+static int is_ta(void) { return is_thread(&g_ta_thread, &g_ta_set); }
+static int is_tb(void) { return is_thread(&g_tb_thread, &g_tb_set); }
+static void register_self(pthread_t *t, int *set) {
+  pthread_mutex_lock(&g_m); *t = pthread_self(); *set = 1; pthread_mutex_unlock(&g_m);
+}
 static int is_d_thread(void) {
   pthread_mutex_lock(&g_m);
   int r = g_d_thread_set && pthread_equal(g_d_thread, pthread_self());
@@ -73,7 +86,8 @@ static void test_hook(const char *name) {
     pthread_mutex_lock(&g_m); g_polls++; pthread_cond_broadcast(&g_c); pthread_mutex_unlock(&g_m);
     hold_point(&H_in_read);
   } else if (!strcmp(name, "before_callbacks")) hold_point(&H_before_cb);
-  else if (!strcmp(name, "api_entered")) { if (is_d_thread()) hold_point(&H_api_entered); }
+  else if (!strcmp(name, "api_entered")) { event(EV_API_ENTERED); if (is_d_thread()) hold_point(&H_api_entered); }
+  else if (!strcmp(name, "pin_state_held")) { if (is_ta()) hold_point(&H_pin); else if (is_tb()) event(EV_PIN_HELD_TB); }
   else if (!strcmp(name, "api_exit")) { if (is_d_thread()) event(EV_API_EXIT_D); }
   else if (!strcmp(name, "worker_exit")) event(EV_WORKER_EXIT);
   else if (!strcmp(name, "deinit_entered")) event(EV_DEINIT_ENTERED);
@@ -82,6 +96,7 @@ static void test_hook(const char *name) {
 
 /* ---- wrappers for the library's pthread calls ---------------------------------------------------------------- */
 static int g_created, g_joined, g_fail_create, g_spurious, g_fail_cond_init, g_mutex_destroyed, g_cond_destroyed;
+static int g_fail_join, g_cond_clock = -1;
 static struct timespec g_deadlines[16];
 static int g_deadline_polls[16], g_ndeadlines;
 
@@ -92,6 +107,7 @@ static int w_create(pthread_t *t, const pthread_attr_t *a, void *(*f)(void *), v
 }
 static int w_join(pthread_t t, void **r) {
   event(EV_JOIN_ENTER);
+  if (g_fail_join) return EINVAL;
   int rc = pthread_join(t, r);
   __atomic_fetch_add(&g_joined, 1, __ATOMIC_SEQ_CST);
   event(EV_JOIN_RETURN);
@@ -102,6 +118,11 @@ static int w_cond_init(pthread_cond_t *c, const pthread_condattr_t *a) {
   return pthread_cond_init(c, a);
 }
 static int w_mutex_destroy(pthread_mutex_t *m) { g_mutex_destroyed++; return pthread_mutex_destroy(m); }
+static int w_mutex_lock(pthread_mutex_t *m) {
+  if (m == g_watch_mutex && is_tb()) event(EV_PIN_LOCK_TB);
+  return pthread_mutex_lock(m);
+}
+static int w_condattr_setclock(pthread_condattr_t *a, clockid_t c) { g_cond_clock = (int) c; return pthread_condattr_setclock(a, c); }
 static int w_cond_destroy(pthread_cond_t *c) { g_cond_destroyed++; return pthread_cond_destroy(c); }
 static int w_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
   if (is_deinit_thread()) event(EV_DEINIT_COND_WAIT);
@@ -126,6 +147,8 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #define pthread_cond_init w_cond_init
 #define pthread_mutex_destroy w_mutex_destroy
 #define pthread_cond_destroy w_cond_destroy
+#define pthread_mutex_lock w_mutex_lock
+#define pthread_condattr_setclock w_condattr_setclock
 #include "../libpinedio-usb.c"
 #undef pthread_create
 #undef pthread_join
@@ -134,6 +157,8 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #undef pthread_cond_init
 #undef pthread_mutex_destroy
 #undef pthread_cond_destroy
+#undef pthread_mutex_lock
+#undef pthread_condattr_setclock
 #include "fake_helpers.h"
 
 /* ---- fixtures ------------------------------------------------------------------------------------------------ */
@@ -235,7 +260,11 @@ static void during_held_poll(struct pinedio_inst *inst, void *(*fn)(void *)) {
   wait_arrived(&H_in_read);
   pthread_t t;
   void *r;
+  int entered = ev_n(EV_API_ENTERED);
   assert(pthread_create(&t, NULL, fn, inst) == 0);
+  pthread_mutex_lock(&g_m);                      /* the helper is counted and goes for the mutex the worker holds */
+  while (g_ev_n[EV_API_ENTERED] == entered) pthread_cond_wait(&g_c, &g_m);
+  pthread_mutex_unlock(&g_m);
   release(&H_in_read);
   pthread_join(t, &r);
   assert((intptr_t) r == 0);
@@ -288,12 +317,13 @@ static void s3b(void) {
   for (int k = 0; k < 10; k++)
     assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING | PINEDIO_INT_MODE_FALLING, cb_hold) == 0);
   arm(&H_cb);
-  for (uint8_t v = 1; ; v ^= 1) {                 /* toggle until a poller has taken an edge (no sleep) */
-    set_input(v);
-    pthread_mutex_lock(&g_m); int got = H_cb.arrived; pthread_mutex_unlock(&g_m);
-    if (got) break;
-    sched_yield();
-  }
+  set_input(0);
+  /* every attach reset the pin's previous state: two more handle_events (one whole poll of some poller) set it
+   * to 0, then one change is an edge for the next poll */
+  int ev0 = __atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST);
+  while (__atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST) < ev0 + 2) sched_yield();
+  set_input(1);
+  wait_arrived(&H_cb);
   pthread_t h = start_deinit(inst);
   wait_event(EV_JOIN_ENTER);
   int during = live_threads();
@@ -316,6 +346,9 @@ static void s4b(void) {                          /* public path: no hook wait */
   *inst = fresh(NULL);
   assert(pinedio_init(inst, NULL) == 0);
   assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, cb_a) == 0);
+  pthread_mutex_lock(&g_m);                      /* the worker has entered its interval wait */
+  while (g_ndeadlines == 0) pthread_cond_wait(&g_c, &g_m);
+  pthread_mutex_unlock(&g_m);
   assert(pinedio_deinit(inst) == 0 && g_joined == 1);
   int after;
   while ((after = live_threads()) > 1) sched_yield();
@@ -466,6 +499,7 @@ static void s9(void) {
   clock_gettime(CLOCK_MONOTONIC, &now);
   long long ahead = (first.tv_sec - now.tv_sec) * 1000000000LL + (first.tv_nsec - now.tv_nsec);
   assert(ahead < 1000000000LL && ahead > -1000000000LL);   /* a CLOCK_REALTIME deadline is decades off */
+  assert(g_cond_clock == CLOCK_MONOTONIC);                   /* the condvar waits on the same clock */
   close_inst(inst);
 }
 
@@ -531,6 +565,11 @@ static void s13a(void) {
   assert(pinedio_transceive(inst, b, b, sizeof(b)) == -1);
   assert(pinedio_digital_write(inst, 1, true) == -1);
   assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D1, PINEDIO_INT_MODE_RISING, cb_b) == -1);
+  assert(pinedio_deattach_interrupt(inst, PINEDIO_PIN_D0) == -1);
+  assert(pinedio_digital_read(inst, 1) == -1);
+  assert(pinedio_write_read(inst, b, 1, b, 1) == -1);
+  assert(pinedio_set_cs(inst, true) == -1);
+  assert(pinedio_set_pin_mode(inst, 1, 1) == -1);
   assert(g_fake_submits == submits);
   release(&H_before_cb);
   pthread_join(h, NULL);
@@ -555,6 +594,119 @@ static void s13b(void) {
   assert(g_ev_seq[EV_API_EXIT_D] < g_ev_seq[EV_DEINIT_PAST_WAIT]);
   memset(inst, 0xA5, sizeof(*inst));
   free(inst);
+}
+
+/* S11e: a transfer that cannot be allocated (the OUT one, or the k-th IN one) fails init with -3, never the
+ * stale 0 of the claim; what was allocated is freed, the device closed, the mutex and condvar destroyed. */
+static void s11e(void) {
+  for (int k = 0; k <= USB_IN_TRANSFERS; k++) {
+    devices(1); g_fake_io_ok = 1;
+    g_fake_allocs = 0; g_fake_alloc_fail_at = k; g_fake_freed = 0; g_mutex_destroyed = g_cond_destroyed = 0;
+    struct pinedio_inst *inst = calloc(1, sizeof(*inst));
+    *inst = fresh(NULL);
+    assert(pinedio_init(inst, NULL) == -3);
+    assert(g_fake_freed == k && g_devs[0].closed == 1 && g_mutex_destroyed == 1 && g_cond_destroyed == 1);
+    assert(g_created == 0);
+    free(inst);
+  }
+}
+
+/* S14: the process-wide pin state: a pin write on device B waits while device A's write holds it. */
+static struct pinedio_inst *open_at(const char *port) {
+  struct pinedio_inst *inst = calloc(1, sizeof(*inst));
+  *inst = fresh(NULL);
+  assert(pinedio_init_at_port(inst, NULL, port) == 0);
+  return inst;
+}
+static void *ta_write(void *arg) { register_self(&g_ta_thread, &g_ta_set); return (void *) (intptr_t) pinedio_digital_write(arg, 1, true); }
+static void *tb_write(void *arg) { register_self(&g_tb_thread, &g_tb_set); return (void *) (intptr_t) pinedio_digital_write(arg, 2, true); }
+static void s14(void) {
+  devices(2); g_fake_io_ok = 1;
+  g_watch_mutex = &pin_state_mutex;
+  struct pinedio_inst *a = open_at("1-1.1"), *b = open_at("1-1.2");
+  arm(&H_pin);
+  pthread_t ta, tb;
+  assert(pthread_create(&ta, NULL, ta_write, a) == 0);
+  wait_arrived(&H_pin);                           /* A holds the pin state */
+  assert(pthread_create(&tb, NULL, tb_write, b) == 0);
+  assert(wait_either(EV_PIN_LOCK_TB, EV_PIN_HELD_TB) == EV_PIN_LOCK_TB);   /* B goes for the lock first */
+  event(EV_TA_RELEASED);
+  release(&H_pin);
+  void *ra, *rb;
+  pthread_join(ta, &ra); pthread_join(tb, &rb);
+  assert((intptr_t) ra == 0 && (intptr_t) rb == 0);
+  assert(g_ev_seq[EV_TA_RELEASED] < g_ev_seq[EV_PIN_HELD_TB]);
+  assert(pinedio_deinit(a) == 0 && pinedio_deinit(b) == 0);
+  free(a); free(b);
+}
+
+/* S15 (the documented contract): a callback the worker took before a non-final detach still runs once after
+ * that detach returned. */
+static void s15(void) {
+  struct pinedio_inst *inst = open_inst();
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D1, PINEDIO_INT_MODE_RISING, cb_b) == 0);
+  attach_d0(inst, cb_a);
+  arm(&H_before_cb);
+  set_input(0x01);                                /* D0 rises: cb_a copied */
+  wait_arrived(&H_before_cb);
+  assert(pinedio_deattach_interrupt(inst, PINEDIO_PIN_D0) == 0);
+  release(&H_before_cb);
+  wait_event(EV_CB_A);
+  assert(g_cb_a == 1);
+  close_inst(inst);
+}
+
+/* S16: a join that fails is not "terminated": deinit returns -1 and releases nothing; a later deinit frees. */
+static void s16(void) {
+  struct pinedio_inst *inst = open_inst();
+  g_fail_join = 1;
+  assert(pinedio_deinit(inst) == -1);
+  assert(g_fake_freed == 0 && g_devs[0].closed == 0 && g_mutex_destroyed == 0);
+  g_fail_join = 0;
+  assert(pinedio_deinit(inst) == 0);
+  assert(g_fake_freed == USB_IN_TRANSFERS + 1 && g_devs[0].closed == 1 && g_mutex_destroyed == 1);
+  free(inst);
+}
+
+/* S17: the quiet log belongs to the transfer: A's worker polls a gone device quietly; B's failing transfer,
+ * completed inside A's worker's handle_events (the shared default context), still logs its error. */
+static struct hold H_tb_events;
+static void tb_on_events(void) { if (is_tb()) hold_point(&H_tb_events); }
+static void *tb_read(void *arg) { register_self(&g_tb_thread, &g_tb_set); return (void *) (intptr_t) pinedio_digital_read(arg, 1); }
+static void s17(void) {
+  devices(2); g_fake_io_ok = 1;
+  struct pinedio_inst *a = open_at("1-1.1"), *b = open_at("1-1.2");
+  g_inst = a;
+  attach_d0(a, cb_a);
+  __atomic_store_n(&g_fake_fail_status, 1, __ATOMIC_SEQ_CST);
+  int p = polls();
+  wait_polls(p + 3);                              /* A is in_error: its worker reads quietly */
+  assert(__atomic_load_n(&a->in_error, __ATOMIC_SEQ_CST));
+  fflush(stderr);
+  FILE *log = tmpfile();
+  int saved = dup(2);
+  dup2(fileno(log), 2);
+  arm(&H_tb_events);
+  g_fake_on_events = tb_on_events;
+  pthread_t tb;
+  assert(pthread_create(&tb, NULL, tb_read, b) == 0);
+  wait_arrived(&H_tb_events);                     /* B's transfers are queued; B waits before handling them */
+  p = polls();
+  wait_polls(p + 2);                              /* A's worker handles events: B's transfers complete there */
+  release(&H_tb_events);
+  void *rb;
+  pthread_join(tb, &rb);
+  g_fake_on_events = NULL;
+  fflush(stderr);
+  dup2(saved, 2);
+  rewind(log);
+  char line[256];
+  int cb_lines = 0;
+  while (fgets(line, sizeof(line), log)) if (!strncmp(line, "cb_", 3)) cb_lines++;
+  assert((intptr_t) rb < 0 && cb_lines >= 1);
+  __atomic_store_n(&g_fake_fail_status, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_deinit(a) == 0 && pinedio_deinit(b) == 0);
+  free(a); free(b);
 }
 
 /* ---- runner -------------------------------------------------------------------------------------------------- */
@@ -593,6 +745,11 @@ int main(int argc, char **argv) {
     {"S12 NULL callback refused, count untouched", s12},
     {"S13a a call after CLOSING is refused, no device access", s13a},
     {"S13b a call inside its transfer finishes before the free", s13b},
+    {"S11e init: a transfer allocation fails (each position)", s11e},
+    {"S14 the process-wide pin state is held across devices", s14},
+    {"S15 a callback taken before a non-final detach runs once", s15},
+    {"S16 a failed join releases nothing", s16},
+    {"S17 the quiet log belongs to the transfer", s17},
   };
   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     if (argc > 1 && strncmp(cases[i].n, argv[1], strlen(argv[1])) != 0) continue;

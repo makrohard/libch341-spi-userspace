@@ -65,7 +65,6 @@ struct pinedio_inst {
   uint8_t int_running_cnt;          /* pins with a callback (enabled) */
   pthread_mutex_t usb_access_mutex;  /* every USB transfer, the pin table and the fields below */
   pthread_t pin_poll_thread;         /* the poll worker: started by init, joined by deinit */
-  bool pin_poll_thread_exit;         /* unused since the worker lives from init to deinit */
   bool in_error;                     /* set by the first failed poll; stays set until deinit; read with __atomic_load_n */
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
@@ -102,6 +101,8 @@ int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
 /* 0: closed, the instance may be freed. -1: refused (called from a poll callback): nothing released, do not free. */
 int32_t pinedio_deinit(struct pinedio_inst* inst);
+/* OR bits into the process-wide pin mode and state (before an open that must keep a line, e.g. RESET, high). */
+void pinedio_seed_pin_state(uint16_t mode_bits, uint16_t state_bits);
 
 #ifdef __cplusplus
 }

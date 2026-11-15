@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <libusb.h>
@@ -94,11 +95,19 @@ static int g_fake_freed;                /* transfers freed */
 static int g_fake_submits;              /* submits that reached the device */
 static int g_fake_fail_status;          /* atomic: queued transfers complete with LIBUSB_TRANSFER_NO_DEVICE */
 static void (*g_fake_on_events)(void);  /* called at the start of every handle_events (a test hold point) */
-static struct libusb_transfer *g_fake_q[2 * 8 + 2];
+static struct libusb_transfer *g_fake_q[4 * (8 + 1)];
 static int g_fake_nq;
+static int g_fake_events;               /* handle_events calls */
+static int g_fake_alloc_fail_at = -1;   /* the n-th allocation (0 = first) fails */
+static int g_fake_allocs;
+/* The default libusb context is shared by every instance: two instances submit and handle events under their
+ * own mutexes, so the queue has its own lock, and any thread's handle_events completes every queued transfer. */
+static pthread_mutex_t g_fake_qm = PTHREAD_MUTEX_INITIALIZER;
 struct libusb_transfer *libusb_alloc_transfer(int n) {
   (void) n;
-  return g_fake_io_ok ? calloc(1, sizeof(struct libusb_transfer)) : NULL;
+  if (!g_fake_io_ok) return NULL;
+  if (g_fake_allocs++ == g_fake_alloc_fail_at) return NULL;
+  return calloc(1, sizeof(struct libusb_transfer));
 }
 void libusb_free_transfer(struct libusb_transfer *t) {
   if (!t) return;
@@ -108,17 +117,24 @@ void libusb_free_transfer(struct libusb_transfer *t) {
 int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
   __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);
+  pthread_mutex_lock(&g_fake_qm);
   g_fake_q[g_fake_nq++] = t;
+  pthread_mutex_unlock(&g_fake_qm);
   return 0;
 }
 int libusb_cancel_transfer(struct libusb_transfer *t) { (void) t; return 0; }
 int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
   (void) c; (void) tv;
   if (g_fake_on_events) g_fake_on_events();
+  __atomic_fetch_add(&g_fake_events, 1, __ATOMIC_SEQ_CST);
+  struct libusb_transfer *done[4 * (8 + 1)];
+  pthread_mutex_lock(&g_fake_qm);
   int n = g_fake_nq;
+  memcpy(done, g_fake_q, sizeof(done[0]) * (size_t) n);
   g_fake_nq = 0;
+  pthread_mutex_unlock(&g_fake_qm);
   for (int i = 0; i < n; i++) {
-    struct libusb_transfer *t = g_fake_q[i];
+    struct libusb_transfer *t = done[i];
     t->status = __atomic_load_n(&g_fake_fail_status, __ATOMIC_SEQ_CST) ? LIBUSB_TRANSFER_NO_DEVICE
                                                                        : LIBUSB_TRANSFER_COMPLETED;
     t->actual_length = t->length;
