@@ -593,7 +593,7 @@ int32_t pinedio_set_cs(struct pinedio_inst *inst, bool active) {
 
 static int32_t write_read_locked(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt) {
   if (writecnt + readcnt == 0)
-    return -EINVAL;   /* nothing to do: the stack buffers below would have no element (and memset 32 bytes) */
+    return 0;   /* a no-op: nothing to send or read; the stack buffers below would have no element */
   /* How many packets ... */
   const size_t packets = (writecnt + readcnt + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
 
@@ -650,7 +650,7 @@ int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_
 
 static int32_t transceive_locked(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count) {
   if (count == 0)
-    return -EINVAL;   /* nothing to do: the stack buffer below would have no element */
+    return 0;   /* a no-op: nothing to send or read; the stack buffer below would have no element */
   const size_t packets = (count + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
 
   uint8_t wbuf[packets*CH341_PACKET_LENGTH];
