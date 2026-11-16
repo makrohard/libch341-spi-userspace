@@ -786,8 +786,8 @@ static void s28(void) {
 }
 
 /* S29, through the public path: the CS writes around an SPI transfer are checked. With AUTO_CS a transceive is
- * three OUT transfers (CS assert, the SPI stream, CS release). (a) The assert completes short: the call returns -1
- * and sends no SPI stream. (b) The release completes short after a good transfer: -1. (c) init's initial CS write
+ * three OUT transfers (CS assert, the SPI stream, CS release). (a) The assert completes short: the call returns -1,
+ * sends no SPI stream and still releases CS (the short assertion can have reached the device). (b) The release completes short after a good transfer: -1. (c) init's initial CS write
  * completes short: init fails (-3). Before, (a) and (b) returned 0 and init went on. */
 static int out_short_call(int at) {
   struct pinedio_inst *inst = open_inst();
@@ -797,14 +797,15 @@ static int out_short_call(int at) {
   int submits = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST);
   int rc = pinedio_transceive(inst, w, r, sizeof(r));
   int sent = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST) - submits;
+  int released = !(g_fake_last_out[0][1] & 1);   /* the last OUT wrote D0 (CS) inactive */
   __atomic_store_n(&g_fake_out_short_at, 0, __ATOMIC_SEQ_CST);
   printf("     S29 short OUT #%d: rc %d, submits %d\n", at, rc, sent);
   fflush(stdout);
   close_inst(inst);
-  return at == 1 ? (rc == -1 && sent == 1) : rc == -1;
+  return at == 1 ? (rc == -1 && sent == 2 && released) : rc == -1;
 }
 static void s29(void) {
-  assert(out_short_call(1));                      /* (a) no SPI stream after a failed assert */
+  assert(out_short_call(1));                      /* (a) no SPI stream after a failed assert; CS released */
   assert(out_short_call(3));                      /* (b) a failed release fails the call */
   devices(1); g_fake_io_ok = 1;                   /* (c) the initial CS write in init */
   struct pinedio_inst *inst = calloc(1, sizeof(*inst));
@@ -814,6 +815,33 @@ static void s29(void) {
   assert(pinedio_init(inst, NULL) == -3);
   __atomic_store_n(&g_fake_out_short_at, 0, __ATOMIC_SEQ_CST);
   free(inst);
+}
+
+/* S29d, through the public path: the CS assertion's transfer never calls back (abandoned), so the release after
+ * it is refused. The release stays pending: the next transceive releases CS first, then asserts, streams and
+ * releases. Before, that call asserted on a CS left asserted (the SPI stream would continue the half-finished
+ * transaction): three OUT transfers, no release first. */
+static void s29d(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  __atomic_store_n(&g_fake_hold_out, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  assert(inst->req_abandoned);
+  __atomic_store_n(&g_fake_hold_out, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  libusb_handle_events_timeout(NULL, &(struct timeval){0, 0});   /* the late callback comes */
+  __atomic_store_n(&g_fake_out_logn, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == 0);
+  int n = __atomic_load_n(&g_fake_out_logn, __ATOMIC_SEQ_CST);
+  printf("     S29d: %d OUT transfers in the next call\n", n);
+  fflush(stdout);
+  assert(n == 4);
+  assert(g_fake_out_log[0][0] == CH341_CMD_UIO_STREAM && !(g_fake_out_log[0][1] & 1));   /* release first */
+  assert(g_fake_out_log[1][0] == CH341_CMD_UIO_STREAM && (g_fake_out_log[1][1] & 1));    /* assert */
+  assert(g_fake_out_log[2][0] == CH341_CMD_SPI_STREAM);                                  /* the stream */
+  assert(g_fake_out_log[3][0] == CH341_CMD_UIO_STREAM && !(g_fake_out_log[3][1] & 1));   /* release */
+  close_inst(inst);
 }
 
 /* S30 (the gate-2 round 2 case), through the public path: a read whose IN submit fails; the cancel of its
@@ -1201,6 +1229,7 @@ int main(int argc, char **argv) {
     {"S27 a cancelled IN completion is an error, not nothing", s27},
     {"S28 a zero-length transfer is a no-op before any buffer", s28},
     {"S29 the CS writes around a transfer and in init are checked", s29},
+    {"S29d a refused CS release goes out before the next assertion", s29d},
     {"S30 a transfer whose callback never comes: bounded, abandoned, retryable", s30},
     {"S31 an IN callback that never comes: the call ends by its progress deadline", s31},
     {"S32a a caller blocked with the mutex: deinit -1 within its deadline", s32a},

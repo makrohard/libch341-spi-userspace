@@ -126,6 +126,8 @@ static int g_fake_hold_in;             /* IN transfers likewise */
 static int g_fake_out_short_at, g_fake_out_n;   /* the n-th OUT completion (counted from 0 when armed) is short */
 static enum libusb_transfer_status g_fake_in_status[8];   /* IN completions' statuses, in order */
 static int g_fake_in_status_n, g_fake_in_status_i;
+static uint8_t g_fake_out_log[32][2];   /* the first two bytes of each OUT transfer that reached the device */
+static int g_fake_out_logn;
 static void fake_complete(struct libusb_transfer *t);
 int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
@@ -133,6 +135,10 @@ int libusb_submit_transfer(struct libusb_transfer *t) {
   if ((t->endpoint & 0x80) && __atomic_load_n(&g_fake_fail_in_after, __ATOMIC_SEQ_CST) > 0 &&
       __atomic_add_fetch(&g_fake_in_submits, 1, __ATOMIC_SEQ_CST) > __atomic_load_n(&g_fake_fail_in_after, __ATOMIC_SEQ_CST))
     return LIBUSB_ERROR_IO;
+  if (!(t->endpoint & 0x80) && t->length >= 2) {
+    int k = __atomic_fetch_add(&g_fake_out_logn, 1, __ATOMIC_SEQ_CST);
+    if (k < 32) { g_fake_out_log[k][0] = t->buffer[0]; g_fake_out_log[k][1] = t->buffer[1]; }
+  }
   if (__atomic_load_n((t->endpoint & 0x80) ? &g_fake_complete_in_submit : &g_fake_complete_out_in_submit,
                       __ATOMIC_SEQ_CST)) {
     __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);

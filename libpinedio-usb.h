@@ -81,6 +81,7 @@ struct pinedio_inst {
   uint8_t *req_buf_out, *req_buf_in;
   uint32_t req_cap_out, req_cap_in;
   bool req_abandoned;
+  bool cs_release_pending;           /* an AUTO_CS release failed: it goes out before the next assertion */
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
   bool worker_done;                  /* the worker has left its loop (under the mutex; deinit waits for it) */
