@@ -92,16 +92,22 @@ int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_
 int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
 /* Interrupts are polled by one worker thread per instance, started by init and joined by deinit. attach and
- * detach only enable or disable a pin; they never start, stop or wait for a thread. A callback runs on the
- * worker without the library's mutex; it may attach and detach, it must not deinit (refused). A callback the
- * worker took before a detach may still run once after that detach returned; none runs after deinit returns.
- * After deinit has begun, every call is refused (-1). attach refuses a NULL callback. The owner must not start a
- * call once it has started deinit: the library counts and waits for calls that have begun (from their first
- * statement); a call that has not reached its first statement when deinit frees the instance is outside any
- * library's reach. */
+ * detach only enable or disable a pin; they never start, stop or wait for a thread. Behaviour change against
+ * pine64's library: detaching the last pin no longer stops and joins the poll thread; it stays (idle on a
+ * condvar) until deinit. A callback runs on the worker without the library's mutex; it may attach and detach,
+ * it must not deinit (refused, -1). A callback the worker took before a detach may still run once after that
+ * detach returned. After deinit has begun, every call is refused (-1). attach refuses a NULL callback.
+ *
+ * What pinedio_deinit returning 0 guarantees, exactly: the worker has terminated (joined); every call that was
+ * counted (from its first statement) has made its last access to the instance; no callback runs any more; the
+ * transfers are freed, the handle is closed and the mutex and condvar are destroyed. It does not cover a call
+ * that starts after deinit began: the owner must not start one (a call that has not reached its first statement
+ * is outside any library's reach). After 0 the instance may be freed; a second deinit returns 0 and touches
+ * nothing. -1 (from a callback, or a worker that could not be joined): nothing was released, deinit may be
+ * called again. */
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
-/* 0: closed, the instance may be freed. -1: refused (called from a poll callback): nothing released, do not free. */
+/* 0: closed, the instance may be freed (see above). -1: refused (from a callback, or no join): nothing released. */
 int32_t pinedio_deinit(struct pinedio_inst* inst);
 /* OR bits into the pin mode and state every later open starts with (e.g. to keep RESET high on an open);
  * an open device keeps its own copy. pinedio_d_mode / pinedio_d_state are that template. */
