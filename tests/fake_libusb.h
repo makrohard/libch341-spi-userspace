@@ -117,12 +117,19 @@ void libusb_free_transfer(struct libusb_transfer *t) {
 }
 static int g_fake_short;               /* IN transfers complete with 0 bytes (1) or one byte short (2) */
 static int g_fake_fail_in;             /* every IN submit fails (the OUT one goes through) */
+static int g_fake_fail_in_after;       /* > 0: IN submits after that many fail (counted in g_fake_in_submits) */
+static int g_fake_in_submits;
 static int g_fake_complete_in_submit;  /* complete an IN transfer inside submit (another thread's events) */
+static int g_fake_complete_out_in_submit;   /* the same for an OUT transfer */
 static void fake_complete(struct libusb_transfer *t);
 int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
   if ((t->endpoint & 0x80) && __atomic_load_n(&g_fake_fail_in, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
-  if ((t->endpoint & 0x80) && __atomic_load_n(&g_fake_complete_in_submit, __ATOMIC_SEQ_CST)) {
+  if ((t->endpoint & 0x80) && __atomic_load_n(&g_fake_fail_in_after, __ATOMIC_SEQ_CST) > 0 &&
+      __atomic_add_fetch(&g_fake_in_submits, 1, __ATOMIC_SEQ_CST) > __atomic_load_n(&g_fake_fail_in_after, __ATOMIC_SEQ_CST))
+    return LIBUSB_ERROR_IO;
+  if (__atomic_load_n((t->endpoint & 0x80) ? &g_fake_complete_in_submit : &g_fake_complete_out_in_submit,
+                      __ATOMIC_SEQ_CST)) {
     __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);
     fake_complete(t);                  /* done before submit returns, as another event thread could */
     return 0;

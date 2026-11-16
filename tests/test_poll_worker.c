@@ -683,6 +683,65 @@ static void s25(void) {
   close_inst(inst);
 }
 
+/* S22b, the IN twin of S22: a 40-byte read takes two IN transfers. Its OUT transfer completes at once (inside
+ * its submit), the first IN transfer is submitted, the second IN submit fails, and the cancel of the submitted IN
+ * transfer answers NOT_FOUND. The call returns -1 only after that transfer's callback has run: none of its
+ * transfers is still queued. A failed IN cancel that marked the transfer failed returned with it still queued. */
+static void s22b(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[40] = {0}, r[40] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  __atomic_store_n(&g_fake_in_submits, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_fail_in_after, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_complete_out_in_submit, 1, __ATOMIC_SEQ_CST);
+  int cancels = __atomic_load_n(&g_fake_cancels, __ATOMIC_SEQ_CST);
+  int rc = pinedio_transceive(inst, w, r, sizeof(r));
+  int queued = fake_queued();
+  __atomic_store_n(&g_fake_complete_out_in_submit, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_fail_in_after, 0, __ATOMIC_SEQ_CST);
+  printf("     S22b: rc %d, cancels %d, still queued at return %d\n", rc,
+         __atomic_load_n(&g_fake_cancels, __ATOMIC_SEQ_CST) - cancels, queued);
+  fflush(stdout);
+  assert(rc == -1 && queued == 0 && __atomic_load_n(&g_fake_cancels, __ATOMIC_SEQ_CST) - cancels == 1);
+  close_inst(inst);
+}
+
+/* S26a/b: attach and detach with a rejected argument are counted before the argument check: held at
+ * api_entered (counted, before its lock) while deinit starts, deinit waits for it (its api_active wait) and
+ * returns only after the call was released and left with -1. With the check before api_enter the call never
+ * reached api_entered and returned uncounted (the hold is never reached: the child's alarm). */
+static int g_bad_rc = 99;
+static void *d_attach_bad(void *arg) {
+  register_self(&g_d_thread, &g_d_thread_set);
+  g_bad_rc = pinedio_attach_interrupt(arg, (enum pinedio_int_pin) PINEDIO_INT_PIN_MAX, PINEDIO_INT_MODE_RISING, cb_a);
+  return NULL;
+}
+static void *d_detach_bad(void *arg) {
+  register_self(&g_d_thread, &g_d_thread_set);
+  g_bad_rc = pinedio_deattach_interrupt(arg, (enum pinedio_int_pin) 255);
+  return NULL;
+}
+static void rejected_call_counted(void *(*fn)(void *)) {
+  struct pinedio_inst *inst = open_inst();
+  arm(&H_api_entered);
+  pthread_t d;
+  assert(pthread_create(&d, NULL, fn, inst) == 0);
+  wait_arrived(&H_api_entered);                   /* counted, before its lock */
+  pthread_t h = start_deinit(inst);
+  assert(wait_either(EV_DEINIT_COND_WAIT, EV_DEINIT_PAST_WAIT) == EV_DEINIT_COND_WAIT);
+  release(&H_api_entered);
+  pthread_join(d, NULL);
+  pthread_join(h, NULL);
+  assert(g_bad_rc == -1);
+  assert(g_ev_seq[EV_API_EXIT_D] < g_ev_seq[EV_DEINIT_PAST_WAIT]);
+  memset(inst, 0xA5, sizeof(*inst));
+  free(inst);
+}
+static void s26a(void) { rejected_call_counted(d_attach_bad); }
+static void s26b(void) { rejected_call_counted(d_detach_bad); }
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -895,9 +954,12 @@ int main(int argc, char **argv) {
     {"S20 an OUT submit failure reads no unset IN state", s20},
     {"S21 a failed IN submit is not cancelled", s21},
     {"S22 a failed cancel waits for the callback", s22},
+    {"S22b a failed IN cancel waits for the callback", s22b},
     {"S23 rejected attach/detach arguments leave no call counted", s23},
     {"S24 a second deinit touches no destroyed sync object", s24},
     {"S25 a short or zero-byte completion is an error", s25},
+    {"S26a a rejected attach is counted before its check", s26a},
+    {"S26b a rejected detach is counted before its check", s26b},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
