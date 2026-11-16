@@ -757,12 +757,13 @@ static void *pinedio_poll_worker(void *arg) {
 int32_t
 pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode,
                          void (*callback)(void)) {
-  if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX || callback == NULL) {
-    return -1;   /* a NULL callback would enable nothing: detach disables a pin */
-  }
-  if (api_enter(inst) != 0) {
+  if (api_enter(inst) != 0) {   /* first: the call is counted before anything else */
     fprintf(stderr, "pinedio_attach_interrupt: instance is closing, refused\n");
     return -1;
+  }
+  if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX || callback == NULL) {
+    api_exit(inst);
+    return -1;   /* a NULL callback would enable nothing: detach disables a pin */
   }
   if (inst->interrupts[int_pin].callback == NULL)
     inst->int_running_cnt++;
@@ -776,10 +777,11 @@ pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin
 
 /* Disable a pin. -1 when it was not enabled or the instance is closing. */
 int32_t pinedio_deattach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin) {
-  if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX) {
+  if (api_enter(inst) != 0) {   /* first: the call is counted before anything else */
     return -1;
   }
-  if (api_enter(inst) != 0) {
+  if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX) {
+    api_exit(inst);
     return -1;
   }
   int32_t res = -1;

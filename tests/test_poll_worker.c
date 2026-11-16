@@ -632,6 +632,18 @@ static void s22(void) {
   close_inst(inst);
 }
 
+/* S23: attach and detach are counted from their first statement, rejected arguments included: after
+ * rejected calls (a pin past the table, a NULL callback) no call is left counted and deinit returns. A rejected
+ * call that left without its api_exit would leave deinit waiting forever (the child's alarm). */
+static void s23(void) {
+  struct pinedio_inst *inst = open_inst();
+  assert(pinedio_attach_interrupt(inst, (enum pinedio_int_pin) PINEDIO_INT_PIN_MAX, PINEDIO_INT_MODE_RISING, cb_a) == -1);
+  assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, NULL) == -1);
+  assert(pinedio_deattach_interrupt(inst, (enum pinedio_int_pin) 255) == -1);
+  assert(__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -844,6 +856,7 @@ int main(int argc, char **argv) {
     {"S20 an OUT submit failure reads no unset IN state", s20},
     {"S21 a failed IN submit is not cancelled", s21},
     {"S22 a failed cancel waits for the callback", s22},
+    {"S23 rejected attach/detach arguments leave no call counted", s23},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
