@@ -308,10 +308,11 @@ static void s3b(void) {
     assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING | PINEDIO_INT_MODE_FALLING, cb_hold) == 0);
   arm(&H_cb);
   set_input(0);
-  /* every attach reset the pin's previous state: two more handle_events (one whole poll of some poller) set it
-   * to 0, then one change is an edge for the next poll */
+  /* every attach reset the pin's previous state. A poller commits it (0) after its read, before its next read:
+   * 12 handle_events after the last attach are more than one per poller (at most 11 here), so some poller entered
+   * twice, and its first read after the attach has been committed. Then one change is an edge. */
   int ev0 = __atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST);
-  while (__atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST) < ev0 + 2) sched_yield();
+  while (__atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST) < ev0 + 12) sched_yield();
   set_input(1);
   wait_arrived(&H_cb);
   pthread_t h = start_deinit(inst);
@@ -608,7 +609,7 @@ static void s13b(void) {
   struct pinedio_inst *inst = open_inst();
   pthread_t d;
   arm(&H_events);
-  g_fake_on_events = on_events;
+  __atomic_store_n(&g_fake_on_events, on_events, __ATOMIC_SEQ_CST);
   assert(pthread_create(&d, NULL, d_thread, inst) == 0);
   wait_arrived(&H_events);                        /* D holds the mutex inside its transfer */
   pthread_t h = start_deinit(inst);
@@ -712,7 +713,7 @@ static void s17(void) {
   int saved = dup(2);
   dup2(fileno(log), 2);
   arm(&H_tb_events);
-  g_fake_on_events = tb_on_events;
+  __atomic_store_n(&g_fake_on_events, tb_on_events, __ATOMIC_SEQ_CST);
   pthread_t tb;
   assert(pthread_create(&tb, NULL, tb_read, b) == 0);
   wait_arrived(&H_tb_events);                     /* B's transfers are queued; B waits before handling them */
@@ -721,7 +722,7 @@ static void s17(void) {
   release(&H_tb_events);
   void *rb;
   pthread_join(tb, &rb);
-  g_fake_on_events = NULL;
+  __atomic_store_n(&g_fake_on_events, NULL, __ATOMIC_SEQ_CST);
   fflush(stderr);
   dup2(saved, 2);
   rewind(log);
