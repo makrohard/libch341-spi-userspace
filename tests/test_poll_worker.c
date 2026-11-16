@@ -596,6 +596,21 @@ static void s20(void) {
   close_inst(inst);
 }
 
+/* S21, through the public path: the OUT submit of a read goes through and the first IN submit fails. The
+ * failed IN transfer is marked failed, so the cleanup cancels only the submitted OUT transfer (one cancel) and
+ * the call returns -1. Without that mark the IN transfer still looks active (it is marked before its submit):
+ * the cleanup cancels a transfer that was never submitted and waits for it forever (the child's alarm). */
+static void s21(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  int cancels = __atomic_load_n(&g_fake_cancels, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_fail_in, 1, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  __atomic_store_n(&g_fake_fail_in, 0, __ATOMIC_SEQ_CST);
+  assert(__atomic_load_n(&g_fake_cancels, __ATOMIC_SEQ_CST) == cancels + 1);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -806,6 +821,7 @@ int main(int argc, char **argv) {
     {"S18 transceive returns the bytes reversed, in order", s18},
     {"S19 an IN transfer completed inside its submit", s19},
     {"S20 an OUT submit failure reads no unset IN state", s20},
+    {"S21 a failed IN submit is not cancelled", s21},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
