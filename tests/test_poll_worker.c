@@ -776,6 +776,37 @@ static void s28(void) {
   close_inst(inst);
 }
 
+/* S29, through the public path: the CS writes around an SPI transfer are checked. With AUTO_CS a transceive is
+ * three OUT transfers (CS assert, the SPI stream, CS release). (a) The assert completes short: the call returns -1
+ * and sends no SPI stream. (b) The release completes short after a good transfer: -1. (c) init's initial CS write
+ * completes short: init fails (-3). Before, (a) and (b) returned 0 and init went on. */
+static int out_short_call(int at) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  __atomic_store_n(&g_fake_out_n, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_out_short_at, at, __ATOMIC_SEQ_CST);
+  int submits = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST);
+  int rc = pinedio_transceive(inst, w, r, sizeof(r));
+  int sent = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST) - submits;
+  __atomic_store_n(&g_fake_out_short_at, 0, __ATOMIC_SEQ_CST);
+  printf("     S29 short OUT #%d: rc %d, submits %d\n", at, rc, sent);
+  fflush(stdout);
+  close_inst(inst);
+  return at == 1 ? (rc == -1 && sent == 1) : rc == -1;
+}
+static void s29(void) {
+  assert(out_short_call(1));                      /* (a) no SPI stream after a failed assert */
+  assert(out_short_call(3));                      /* (b) a failed release fails the call */
+  devices(1); g_fake_io_ok = 1;                   /* (c) the initial CS write in init */
+  struct pinedio_inst *inst = calloc(1, sizeof(*inst));
+  *inst = fresh(NULL);
+  __atomic_store_n(&g_fake_out_n, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_out_short_at, 1, __ATOMIC_SEQ_CST);
+  assert(pinedio_init(inst, NULL) == -3);
+  __atomic_store_n(&g_fake_out_short_at, 0, __ATOMIC_SEQ_CST);
+  free(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -996,6 +1027,7 @@ int main(int argc, char **argv) {
     {"S26b a rejected detach is counted before its check", s26b},
     {"S27 a cancelled IN completion is an error, not nothing", s27},
     {"S28 a zero-length transfer is refused before any buffer", s28},
+    {"S29 the CS writes around a transfer and in init are checked", s29},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

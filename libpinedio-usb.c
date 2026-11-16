@@ -467,7 +467,11 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
    * Only thing required is pinmux, what is anyway configured by CS change function.
    */
 
-  pinedio_set_cs(inst, false);
+  if (pinedio_set_cs(inst, false) != 0) {
+    fprintf(stderr, "Failed to set the initial CS level.\n");
+    ret = -3;   /* the libusb reference was taken */
+    goto deinit_on_error;
+  }
 
   ret = pthread_create(&inst->pin_poll_thread, NULL, pinedio_poll_worker, inst);
   if (ret != 0) {
@@ -552,8 +556,8 @@ static int32_t write_read_locked(struct pinedio_inst* inst, uint8_t *writearr, u
   /* CS usage is optimized by doing both transitions in one packet.
    * Final transition to deselected state is in the pin disable. */
 //  pluck_cs(ptr, &data->stored_delay_us);
-  if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    digital_write_locked(inst, 0, true);
+  if (inst->options[PINEDIO_OPTION_AUTO_CS] && digital_write_locked(inst, 0, true) < 0) {
+    return -1;   /* CS not asserted: no SPI transfer */
   }
   unsigned int write_left = writecnt;
   unsigned int read_left = readcnt;
@@ -575,9 +579,9 @@ static int32_t write_read_locked(struct pinedio_inst* inst, uint8_t *writearr, u
 
   int32_t ret = usb_transfer(inst, "pinedio_write_read", packets + writecnt + readcnt,
                              writecnt + readcnt, wbuf, rbuf);
-  if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    digital_write_locked(inst, 0, false);
-  }
+  /* CS is released even after a failed transfer; a failed release fails a transfer that went through */
+  if (inst->options[PINEDIO_OPTION_AUTO_CS] && digital_write_locked(inst, 0, false) < 0 && ret == 0)
+    ret = -1;
   if (ret < 0)
     return -1;
 
@@ -602,8 +606,8 @@ static int32_t transceive_locked(struct pinedio_inst* inst, uint8_t *write_buf, 
 
 
   uint8_t *ptr = wbuf;
-  if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    digital_write_locked(inst, 0, true);
+  if (inst->options[PINEDIO_OPTION_AUTO_CS] && digital_write_locked(inst, 0, true) < 0) {
+    return -1;   /* CS not asserted: no SPI transfer */
   }
   unsigned int write_left = count;
   unsigned int read_left = count;
@@ -625,9 +629,9 @@ static int32_t transceive_locked(struct pinedio_inst* inst, uint8_t *write_buf, 
 
   int32_t ret = usb_transfer(inst, "pinedio_transceive", packets + count,
                              count, wbuf, read_buf);
-  if (inst->options[PINEDIO_OPTION_AUTO_CS]) {
-    digital_write_locked(inst, 0, false);
-  }
+  /* CS is released even after a failed transfer; a failed release fails a transfer that went through */
+  if (inst->options[PINEDIO_OPTION_AUTO_CS] && digital_write_locked(inst, 0, false) < 0 && ret == 0)
+    ret = -1;
   if (ret < 0)
     return -1;
 

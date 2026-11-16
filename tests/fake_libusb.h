@@ -121,6 +121,7 @@ static int g_fake_fail_in_after;       /* > 0: IN submits after that many fail (
 static int g_fake_in_submits;
 static int g_fake_complete_in_submit;  /* complete an IN transfer inside submit (another thread's events) */
 static int g_fake_complete_out_in_submit;   /* the same for an OUT transfer */
+static int g_fake_out_short_at, g_fake_out_n;   /* the n-th OUT completion (counted from 0 when armed) is short */
 static enum libusb_transfer_status g_fake_in_status[8];   /* IN completions' statuses, in order */
 static int g_fake_in_status_n, g_fake_in_status_i;
 static void fake_complete(struct libusb_transfer *t);
@@ -178,6 +179,9 @@ static void fake_complete(struct libusb_transfer *t) {
     }
     int short_mode = __atomic_load_n(&g_fake_short, __ATOMIC_SEQ_CST);   /* 1: zero bytes, 2: one short */
     t->actual_length = (t->endpoint & 0x80) && short_mode ? (short_mode == 1 ? 0 : t->length - 1) : t->length;
+    if (!(t->endpoint & 0x80) && __atomic_load_n(&g_fake_out_short_at, __ATOMIC_SEQ_CST) > 0 &&
+        __atomic_add_fetch(&g_fake_out_n, 1, __ATOMIC_SEQ_CST) == __atomic_load_n(&g_fake_out_short_at, __ATOMIC_SEQ_CST))
+      t->actual_length = t->length - 1;                         /* this OUT completes one byte short */
     if (t->endpoint & 0x80)
       for (int k = 0; k < t->length && k < 3; k++) t->buffer[k] = __atomic_load_n(&g_fake_in[k], __ATOMIC_SEQ_CST);
     t->callback(t);
