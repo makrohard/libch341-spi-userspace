@@ -10,6 +10,9 @@
  * Copyright (C) 2015 Urja Rannikko <urjaman@gmail.com>
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* pthread_mutex_clocklock (glibc) */
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,8 +110,41 @@ enum trans_state {TRANS_ACTIVE = -2, TRANS_ERR = -1, TRANS_IDLE = 0};
 #define xfer_state pinedio_xfer_state
 
 #ifndef PINEDIO_DRAIN_MS
-#define PINEDIO_DRAIN_MS 3000   /* the cleanup waits at most this long for its transfers' callbacks */
+#define PINEDIO_DRAIN_MS 3000   /* the cleanup, and deinit in all, wait at most this long */
 #endif
+#ifndef PINEDIO_XFER_MS
+#define PINEDIO_XFER_MS 3000    /* a request whose transfers make no progress this long fails (each has 1 s) */
+#endif
+
+/* Monotonic deadlines. */
+static void deadline_after(struct timespec *end, long ms) {
+  clock_gettime(CLOCK_MONOTONIC, end);
+  end->tv_sec += ms / 1000;
+  end->tv_nsec += (ms % 1000) * 1000000L;
+  if (end->tv_nsec >= 1000000000L) { end->tv_sec++; end->tv_nsec -= 1000000000L; }
+}
+/* false once end has passed; else tv = the time left, at most cap_us. */
+static bool time_left(const struct timespec *end, struct timeval *tv, long cap_us) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long us = (long long) (end->tv_sec - now.tv_sec) * 1000000LL + (end->tv_nsec - now.tv_nsec) / 1000;
+  if (us <= 0)
+    return false;
+  if (us > cap_us)
+    us = cap_us;
+  tv->tv_sec = (time_t) (us / 1000000);
+  tv->tv_usec = (suseconds_t) (us % 1000000);
+  return true;
+}
+/* Lock m, waiting at most until end (glibc's monotonic timed lock; elsewhere an unbounded lock). */
+static int lock_until(pthread_mutex_t *m, const struct timespec *end) {
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))
+  return pthread_mutex_clocklock(m, CLOCK_MONOTONIC, end);
+#else
+  (void) end;
+  return pthread_mutex_lock(m);
+#endif
+}
 
 /* st is written by whichever thread handles the libusb events (another instance's worker, too) and read by the
  * usb_transfer call that owns it: every access is atomic. */
@@ -161,18 +197,13 @@ static bool req_settled(struct pinedio_inst *inst) {
   return true;
 }
 
-/* Handle libusb events until the request is settled or PINEDIO_DRAIN_MS (monotonic) have passed. */
-static bool req_drain(struct pinedio_inst *inst) {
-  struct timespec now, end;
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  end.tv_sec += PINEDIO_DRAIN_MS / 1000;
-  end.tv_nsec += (long) (PINEDIO_DRAIN_MS % 1000) * 1000000L;
-  if (end.tv_nsec >= 1000000000L) { end.tv_sec++; end.tv_nsec -= 1000000000L; }
+/* Handle libusb events until the request is settled or end (monotonic) has passed; no event wait goes past end. */
+static bool req_drain(struct pinedio_inst *inst, const struct timespec *end) {
+  struct timeval tv;
   while (!req_settled(inst)) {
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec))
+    if (!time_left(end, &tv, 100000))
       return false;
-    libusb_handle_events_timeout(NULL, &(struct timeval){0, 100000});
+    libusb_handle_events_timeout(NULL, &tv);
   }
   return true;
 }
@@ -180,6 +211,7 @@ static bool req_drain(struct pinedio_inst *inst) {
 static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigned int writecnt, unsigned int readcnt,
                             const uint8_t *writearr, uint8_t *readarr)
 {
+  bool stalled = false;   /* no transfer progressed within PINEDIO_XFER_MS */
   /* An abandoned request (a transfer whose callback did not come within the drain deadline) blocks every new one
    * until that callback has run: its states and buffers may still be written. */
   if (inst->req_abandoned) {
@@ -235,6 +267,11 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   unsigned int in_active = 0;
   unsigned int out_done = 0;
   uint8_t *in_buf = inst->req_buf_in;
+  /* A callback that never comes (a failed timeout cancellation, a broken backend) must not hold the mutex for
+   * ever: without progress for PINEDIO_XFER_MS the request fails through the cleanup below (cancel, bounded
+   * drain, abandonment). Every completion restarts the deadline. */
+  struct timespec end;
+  deadline_after(&end, PINEDIO_XFER_MS);
   do {
     /* Schedule new reads as long as there are free transfers and unscheduled bytes to read. */
     while ((in_done + in_active) < readcnt && ST_GET(ts_in[free_idx]) == TRANS_IDLE) {
@@ -258,7 +295,12 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     }
 
     /* Actually get some work done. */
-    libusb_handle_events_timeout(NULL, &(struct timeval){1, 0});
+    struct timeval tv;
+    if (!time_left(&end, &tv, 1000000)) {
+      stalled = true;
+      goto err;
+    }
+    libusb_handle_events_timeout(NULL, &tv);
 
     /* Check for the write */
     if (out_done < writecnt) {
@@ -267,6 +309,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       } else if (ST_GET((*ts_outp)) > 0) {
         out_done += ST_GET((*ts_outp));
         ST_SET((*ts_outp), TRANS_IDLE);
+        deadline_after(&end, PINEDIO_XFER_MS);
       }
     }
     /* Check for completed transfers. */
@@ -279,6 +322,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       in_active -= ST_GET(ts_in[in_idx]);
       ST_SET(ts_in[in_idx], TRANS_IDLE);
       in_idx = (in_idx + 1) % USB_IN_TRANSFERS; /* Increment (and wrap around). */
+      deadline_after(&end, PINEDIO_XFER_MS);
     }
   } while ((out_done < writecnt) || (in_done < readcnt));
 
@@ -287,6 +331,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   return 0;
 err:
   /* Clean up on errors. */
+  if (func && stalled) fprintf(stderr, "%s: no USB transfer progress within %d ms\n", func, PINEDIO_XFER_MS);
   if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ST_GET((*ts_outp)) == TRANS_ERR) ? "write" : "read",
            (ST_GET((*ts_outp)) == TRANS_ERR) ? writecnt : readcnt);
   /* First, we must cancel any ongoing requests and wait for them to be canceled. Only the callback publishes
@@ -307,7 +352,9 @@ err:
   /* Wait for the callbacks, at most PINEDIO_DRAIN_MS in all. A transfer whose callback does not come (a failed
    * cancel, a broken backend) abandons the request: nothing of it is reused or freed while that callback is
    * possible, later calls are refused until it has run, and deinit returns -1 (retryable) meanwhile. */
-  if (!req_drain(inst)) {
+  struct timespec drain_end;
+  deadline_after(&drain_end, PINEDIO_DRAIN_MS);
+  if (!req_drain(inst, &drain_end)) {
     inst->req_abandoned = true;
     fprintf(stderr, "%s: a USB transfer did not end within %d ms: request abandoned\n",
             func ? func : "usb_transfer", PINEDIO_DRAIN_MS);
@@ -367,6 +414,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   for (int i = 0; i < USB_IN_TRANSFERS; i++)
     inst->transfer_ins[i] = NULL;
   inst->worker_started = false;
+  inst->worker_done = false;
   inst->closed = false;
   inst->int_running_cnt = 0;
   for (int i = 0; i < PINEDIO_INT_PIN_MAX; i++) {
@@ -816,6 +864,8 @@ static void *pinedio_poll_worker(void *arg) {
         break;
     }
   }
+  inst->worker_done = true;   /* deinit's bounded wait ends here; its join then only reaps the thread */
+  pthread_cond_broadcast(&inst->poll_cond);
   pthread_mutex_unlock(&inst->usb_access_mutex);
   PINEDIO_TEST_HOOK(worker_exit);
   return NULL;
@@ -873,33 +923,46 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
     return -1;
   }
   PINEDIO_TEST_HOOK(deinit_entered);
-  pthread_mutex_lock(&inst->usb_access_mutex);
+  /* Every wait below ends by one deadline, PINEDIO_DRAIN_MS from here: a caller or a callback that does not
+   * return (a USB event that never comes, a callback blocked in the caller's code) makes deinit return -1,
+   * nothing released, retryable; it never blocks deinit for ever. */
+  struct timespec end;
+  deadline_after(&end, PINEDIO_DRAIN_MS);
+  if (lock_until(&inst->usb_access_mutex, &end) != 0) {
+    fprintf(stderr, "pinedio_deinit: the instance stayed busy for %d ms, nothing released\n", PINEDIO_DRAIN_MS);
+    return -1;
+  }
   inst->closing = true;
   for (int i = 0; i < PINEDIO_INT_PIN_MAX; i++)
     inst->interrupts[i].callback = NULL;
   inst->int_running_cnt = 0;
   pthread_cond_broadcast(&inst->poll_cond);
+  /* The worker leaves its loop and every counted caller passes its last unlock before anything is freed or
+   * destroyed. */
+  while ((inst->worker_started && !inst->worker_done) || __atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) > 0)
+    if (pthread_cond_timedwait(&inst->poll_cond, &inst->usb_access_mutex, &end) == ETIMEDOUT)
+      break;
+  bool busy = (inst->worker_started && !inst->worker_done) || __atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) > 0;
   pthread_mutex_unlock(&inst->usb_access_mutex);
+  if (busy) {
+    fprintf(stderr, "pinedio_deinit: a call or the poll worker did not return within %d ms, nothing released\n",
+            PINEDIO_DRAIN_MS);
+    return -1;
+  }
 
   if (inst->worker_started) {
-    int jr = pthread_join(inst->pin_poll_thread, NULL);
+    int jr = pthread_join(inst->pin_poll_thread, NULL);   /* it has left its loop: only its return is left */
     if (jr != 0) {   /* not proven terminated: release nothing */
       fprintf(stderr, "pinedio_deinit: the poll worker could not be joined (%d), nothing released\n", jr);
       return -1;
     }
     inst->worker_started = false;   /* the worker has terminated */
   }
-
-  /* Every counted caller has passed its last unlock before anything is freed or destroyed. */
-  pthread_mutex_lock(&inst->usb_access_mutex);
-  while (__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) > 0)
-    pthread_cond_wait(&inst->poll_cond, &inst->usb_access_mutex);
-  pthread_mutex_unlock(&inst->usb_access_mutex);
   PINEDIO_TEST_HOOK(deinit_past_wait);
 
-  /* An abandoned request may still be called back: give it one more bounded drain, and free nothing (-1,
-   * retryable) if its callback still has not come. */
-  if (inst->req_abandoned && !req_drain(inst)) {
+  /* An abandoned request may still be called back: drain it within what is left of the deadline, and free
+   * nothing (-1, retryable) if its callback still has not come. */
+  if (inst->req_abandoned && !req_drain(inst, &end)) {
     fprintf(stderr, "pinedio_deinit: a USB transfer is still outstanding, nothing released\n");
     return -1;
   }

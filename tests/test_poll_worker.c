@@ -127,6 +127,10 @@ static int w_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
   return pthread_cond_wait(c, m);
 }
 static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *at) {
+  if (is_deinit_thread()) {                       /* deinit's bounded wait: not a worker deadline */
+    event(EV_DEINIT_COND_WAIT);
+    return pthread_cond_timedwait(c, m, at);
+  }
   pthread_mutex_lock(&g_m);
   int spurious = g_spurious > 0;
   if (g_ndeadlines < 16) { g_deadlines[g_ndeadlines] = *at; g_deadline_polls[g_ndeadlines] = g_polls; g_ndeadlines++; }
@@ -138,7 +142,9 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 }
 
 #define PINEDIO_TEST_HOOK(name) test_hook(#name)
-#define PINEDIO_DRAIN_MS 200   /* the cleanup's drain deadline, short for S30 */
+#define PINEDIO_DRAIN_MS 1000  /* the cleanup's drain deadline and deinit's: short for S30-S32, long enough for
+                                  * the cases that hold a thread while deinit waits */
+#define PINEDIO_XFER_MS 200    /* a request's progress deadline, short for S31 */
 #define pthread_create w_create
 #define pthread_join w_join
 #define pthread_cond_wait w_cond_wait
@@ -366,14 +372,14 @@ static void s5(void) {
   set_input(0x01);                                /* an edge: the worker copies cb_a and holds before calling */
   wait_arrived(&H_before_cb);
   pthread_t h = start_deinit(inst);
-  wait_event(EV_JOIN_ENTER);                      /* closing is set, deinit waits for the worker */
+  wait_event(EV_DEINIT_COND_WAIT);                /* closing is set, deinit waits for the worker and callers */
   pthread_t d;
   arm(&H_api_entered);                            /* held only for D (it registers itself first) */
   assert(pthread_create(&d, NULL, d_thread, inst) == 0);
   wait_arrived(&H_api_entered);                   /* D is counted, not yet locked */
   release(&H_before_cb);                          /* the worker calls cb_a, sees closing, exits */
-  int first = wait_either(EV_DEINIT_COND_WAIT, EV_DEINIT_PAST_WAIT);
-  assert(first == EV_DEINIT_COND_WAIT);           /* deinit waits for D */
+  wait_event(EV_WORKER_EXIT);
+  assert(!ev_n(EV_DEINIT_PAST_WAIT));             /* the worker is gone, D is counted: deinit still waits */
   release(&H_api_entered);
   pthread_join(d, NULL);
   pthread_join(h, NULL);
@@ -395,7 +401,7 @@ static void s6(void) {
   set_input(0x01);
   wait_arrived(&H_before_cb);
   pthread_t h = start_deinit(inst);
-  wait_event(EV_JOIN_ENTER);
+  wait_event(EV_DEINIT_COND_WAIT);
   release(&H_before_cb);
   pthread_join(h, NULL);
   assert(g_cb_rc1 == -1 && g_created == 1 && g_joined == 1 && ev_n(EV_WORKER_EXIT) == 1);
@@ -837,6 +843,93 @@ static void s30(void) {
   free(inst);
 }
 
+/* S31 (the gate-2 round 3 case), through the public path: a read whose OUT transfer completes and whose IN
+ * transfer never calls back (its timeout cancellation fails: no terminal callback). The call fails after the
+ * progress deadline (PINEDIO_XFER_MS), cancels, drains for PINEDIO_DRAIN_MS and abandons the request instead of
+ * waiting forever with the USB mutex held; deinit returns -1 while the transfer is outstanding and 0 once its
+ * callback has come. Red before: the read never returned (the child's alarm). */
+static long ms_since(const struct timespec *t0) {
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  return (long) ((t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000);
+}
+static void s31(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  __atomic_store_n(&g_fake_hold_in, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  long ms = ms_since(&t0);
+  printf("     S31: the call returned after %ld ms\n", ms);
+  fflush(stdout);
+  assert(ms >= PINEDIO_XFER_MS && ms < PINEDIO_XFER_MS + PINEDIO_DRAIN_MS + 1000);
+  assert(inst->req_abandoned && __atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
+  int freed = g_fake_freed;
+  assert(pinedio_deinit(inst) == -1);                                 /* outstanding: nothing released */
+  assert(g_fake_freed == freed && g_devs[0].closed == 0 && !inst->closed);
+  __atomic_store_n(&g_fake_hold_in, 0, __ATOMIC_SEQ_CST);            /* its callback can come now */
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_deinit(inst) == 0 && inst->closed && g_devs[0].closed == 1);
+  free(inst);
+}
+
+/* S32a, through the public path: a caller holds the USB mutex inside its event handling and does not come back
+ * (a callback blocked in the caller's code: the fake's hold point). deinit returns -1 within its one deadline
+ * (PINEDIO_DRAIN_MS) releasing nothing; once the caller has returned, deinit returns 0. Red before: deinit
+ * blocked on the mutex (the child's alarm). */
+static struct hold H_blocked;
+static void blocked_on_events(void) { if (!pthread_equal(pthread_self(), g_main_thread)) hold_point(&H_blocked); }
+static void *blocked_read(void *arg) { return (void *) (intptr_t) pinedio_digital_read(arg, 1); }
+static void s32a(void) {
+  g_main_thread = pthread_self();
+  struct pinedio_inst *inst = open_inst();
+  arm(&H_blocked);
+  __atomic_store_n(&g_fake_on_events, blocked_on_events, __ATOMIC_SEQ_CST);
+  pthread_t t;
+  assert(pthread_create(&t, NULL, blocked_read, inst) == 0);
+  wait_arrived(&H_blocked);                       /* the caller holds the mutex, in its event handling */
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int freed = g_fake_freed;
+  assert(pinedio_deinit(inst) == -1);
+  long ms = ms_since(&t0);
+  printf("     S32a: deinit returned -1 after %ld ms\n", ms);
+  fflush(stdout);
+  assert(ms < PINEDIO_DRAIN_MS + 1000 && g_fake_freed == freed && g_devs[0].closed == 0 && !inst->closed);
+  __atomic_store_n(&g_fake_on_events, NULL, __ATOMIC_SEQ_CST);
+  release(&H_blocked);
+  pthread_join(t, NULL);
+  assert(pinedio_deinit(inst) == 0 && inst->closed && g_devs[0].closed == 1);
+  free(inst);
+}
+
+/* S32b, through the public path: the worker is inside an interrupt callback that does not return. deinit
+ * returns -1 within its one deadline releasing nothing (the worker is not joined); once the callback has
+ * returned, deinit joins the worker and returns 0. Red before: deinit blocked in its join (the child's alarm). */
+static struct hold H_cb_blocked;
+static void cb_blocked(void) { hold_point(&H_cb_blocked); }
+static void s32b(void) {
+  struct pinedio_inst *inst = open_inst();
+  arm(&H_cb_blocked);
+  attach_d0(inst, cb_blocked);
+  set_input(0x01);
+  wait_arrived(&H_cb_blocked);                    /* the worker is in the callback, without the mutex */
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int freed = g_fake_freed;
+  assert(pinedio_deinit(inst) == -1);
+  long ms = ms_since(&t0);
+  printf("     S32b: deinit returned -1 after %ld ms\n", ms);
+  fflush(stdout);
+  assert(ms < PINEDIO_DRAIN_MS + 1000 && g_fake_freed == freed && g_joined == 0 && !inst->closed);
+  release(&H_cb_blocked);
+  assert(pinedio_deinit(inst) == 0 && inst->closed && g_joined == 1);
+  free(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -854,9 +947,9 @@ static void s13a(void) {
   attach_d0(inst, cb_a);
   arm(&H_before_cb);
   set_input(0x01);
-  wait_arrived(&H_before_cb);                     /* the worker is in a callback: deinit will wait in its join */
+  wait_arrived(&H_before_cb);                     /* the worker is in a callback: deinit will wait for it */
   pthread_t h = start_deinit(inst);
-  wait_event(EV_JOIN_ENTER);
+  wait_event(EV_DEINIT_COND_WAIT);
   int submits = g_fake_submits;
   uint8_t b[4] = {0};
   assert(pinedio_get_irq_state(inst, PINEDIO_PIN_D0) == -1);
@@ -1059,6 +1152,9 @@ int main(int argc, char **argv) {
     {"S28 a zero-length transfer is a no-op before any buffer", s28},
     {"S29 the CS writes around a transfer and in init are checked", s29},
     {"S30 a transfer whose callback never comes: bounded, abandoned, retryable", s30},
+    {"S31 an IN callback that never comes: the call ends by its progress deadline", s31},
+    {"S32a a caller blocked with the mutex: deinit -1 within its deadline", s32a},
+    {"S32b a callback that does not return: deinit -1 within its deadline", s32b},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

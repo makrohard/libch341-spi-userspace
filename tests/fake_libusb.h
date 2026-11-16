@@ -122,6 +122,7 @@ static int g_fake_in_submits;
 static int g_fake_complete_in_submit;  /* complete an IN transfer inside submit (another thread's events) */
 static int g_fake_complete_out_in_submit;   /* the same for an OUT transfer */
 static int g_fake_hold_out;            /* OUT transfers stay queued (never completed) while set */
+static int g_fake_hold_in;             /* IN transfers likewise */
 static int g_fake_out_short_at, g_fake_out_n;   /* the n-th OUT completion (counted from 0 when armed) is short */
 static enum libusb_transfer_status g_fake_in_status[8];   /* IN completions' statuses, in order */
 static int g_fake_in_status_n, g_fake_in_status_i;
@@ -164,7 +165,7 @@ int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
   int n = 0, kept = 0;
   for (int i = 0; i < g_fake_nq; i++) {          /* a held OUT transfer stays queued: its callback never comes */
     struct libusb_transfer *t = g_fake_q[i];
-    if (!(t->endpoint & 0x80) && __atomic_load_n(&g_fake_hold_out, __ATOMIC_SEQ_CST)) g_fake_q[kept++] = t;
+    if (__atomic_load_n((t->endpoint & 0x80) ? &g_fake_hold_in : &g_fake_hold_out, __ATOMIC_SEQ_CST)) g_fake_q[kept++] = t;
     else done[n++] = t;
   }
   g_fake_nq = kept;

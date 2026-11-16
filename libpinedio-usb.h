@@ -83,6 +83,7 @@ struct pinedio_inst {
   bool req_abandoned;
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
+  bool worker_done;                  /* the worker has left its loop (under the mutex; deinit waits for it) */
   bool closing;                      /* deinit has begun: every later call is refused */
   bool closed;                       /* deinit ran to the end: the sync objects are gone; deinit again returns 0 */
   int api_active;                    /* calls between their entry and their last unlock (atomic) */
@@ -117,8 +118,11 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * transfers are freed, the handle is closed and the mutex and condvar are destroyed. It does not cover a call
  * that starts after deinit began: the owner must not start one (a call that has not reached its first statement
  * is outside any library's reach). After 0 the instance may be freed; a second deinit returns 0 and touches
- * nothing. -1 (from a callback, a worker that could not be joined, or a USB transfer whose callback has not come
- * within the drain deadline): nothing was released, deinit may be called again. While such a transfer is
+ * nothing. -1 (from a callback; a worker that could not be joined; or, within one deadline of PINEDIO_DRAIN_MS,
+ * a call or the worker (a callback) that has not returned, or a USB transfer whose callback has not come):
+ * nothing was released, deinit may be called again. deinit never blocks longer than that deadline (on glibc;
+ * elsewhere its first lock of the mutex is unbounded). A USB request whose transfers make no progress for
+ * PINEDIO_XFER_MS fails (-1) and is cancelled. While such a transfer is
  * outstanding every call is refused (-1). */
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
