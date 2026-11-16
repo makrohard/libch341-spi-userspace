@@ -128,10 +128,9 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * nothing. -1 (from a callback; a worker that could not be joined; or, within one deadline of PINEDIO_DRAIN_MS,
  * a call or the worker (a callback) that has not returned, or a USB transfer whose callback has not come):
  * nothing was released, deinit may be called again. deinit never blocks longer than that deadline (on glibc;
- * elsewhere its first lock of the mutex is unbounded). A USB request whose transfers make no progress for
- * Its diagnostics are best-effort and never delay its return (nor any other call's): the library writes nothing
- * while its mutex is held and drops a line stderr cannot take at once. A USB request whose transfers make no progress for
- * PINEDIO_XFER_MS fails (-1) and is cancelled; if a cancelled transfer's callback then does not come within
+ * elsewhere its first lock of the mutex is unbounded). Its diagnostics are best-effort and never delay its return
+ * (nor any other call's): the library writes nothing while its mutex is held and drops a line stderr cannot take
+ * at once. A USB request whose transfers make no progress for PINEDIO_XFER_MS fails (-1) and is cancelled; if a cancelled transfer's callback then does not come within
  * PINEDIO_DRAIN_MS, the request is abandoned. While an abandoned request's transfer is outstanding, a call that
  * needs a USB transfer (digital_write, set_cs, digital_read, get_irq_state, a non-empty write_read or transceive,
  * the worker's poll) returns -1 without one; set_pin_mode, attach, detach, set_option and an empty write_read or

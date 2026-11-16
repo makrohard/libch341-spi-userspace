@@ -1202,6 +1202,71 @@ static void s35(void) {
   free(inst);
 }
 
+/* S36, through the public path, with stderr a full blocking pipe: the lines S34 does not reach. (a) S31's sequence
+ * (an IN callback that never comes): the call returns -1 within its deadlines although it abandons the request
+ * (the abandonment line), and deinit returns -1 within its deadline ("still outstanding"); once the callback can
+ * come, deinit returns 0. (b) S32b's sequence (a poll callback that does not return): deinit -1 within its deadline
+ * ("did not return"). (c) S10's sequence (deinit from a poll callback): the callback's deinit returns -1 at once
+ * ("from a poll callback"). Each line written through stdio would block (mutants X13, X9, X8, X10). */
+static void s36a(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  __atomic_store_n(&g_fake_hold_in, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  int saved;
+  stderr_full(&saved);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int rc = pinedio_transceive(inst, w, r, sizeof(r));
+  long call_ms = ms_since(&t0);
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int drc = pinedio_deinit(inst);
+  long d_ms = ms_since(&t0);
+  stderr_back(saved);
+  printf("     S36a: call rc %d after %ld ms (abandoned %d), deinit rc %d after %ld ms\n", rc, call_ms,
+         inst->req_abandoned, drc, d_ms);
+  fflush(stdout);
+  assert(rc == -1 && inst->req_abandoned && call_ms < PINEDIO_XFER_MS + PINEDIO_DRAIN_MS + 500);
+  assert(drc == -1 && d_ms < PINEDIO_DRAIN_MS + 500);
+  __atomic_store_n(&g_fake_hold_in, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_deinit(inst) == 0);
+  free(inst);
+}
+static void s36b(void) {
+  struct pinedio_inst *inst = open_inst();
+  arm(&H_cb_blocked);
+  attach_d0(inst, cb_blocked);
+  set_input(0x01);
+  wait_arrived(&H_cb_blocked);                    /* the worker is in the callback, without the mutex */
+  int saved;
+  stderr_full(&saved);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int drc = pinedio_deinit(inst);
+  long ms = ms_since(&t0);
+  stderr_back(saved);
+  printf("     S36b: deinit rc %d after %ld ms\n", drc, ms);
+  fflush(stdout);
+  assert(drc == -1 && ms < PINEDIO_DRAIN_MS + 500);
+  release(&H_cb_blocked);
+  assert(pinedio_deinit(inst) == 0);
+  free(inst);
+}
+static void s36c(void) {
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_deinit);
+  int saved;
+  stderr_full(&saved);
+  set_input(0x01);
+  int p = polls();
+  wait_polls(p + 2);                              /* the callback ran and its deinit returned */
+  stderr_back(saved);
+  assert(g_deinit_rc == -1 && g_wrapper_freed == 0);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -1436,6 +1501,9 @@ int main(int argc, char **argv) {
     {"S34b stderr blocked: deinit -1 within its deadline", s34b},
     {"S34c stderr blocked: the worker's failing polls hold no mutex", s34c},
     {"S35 deinit's last drain gets what is left of its deadline", s35},
+    {"S36a stderr blocked: an abandoning call and deinit's refusal return", s36a},
+    {"S36b stderr blocked: deinit -1 while a poll callback does not return", s36b},
+    {"S36c stderr blocked: deinit from a poll callback returns -1", s36c},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
