@@ -114,6 +114,12 @@ static int w_cond_init(pthread_cond_t *c, const pthread_condattr_t *a) {
   return pthread_cond_init(c, a);
 }
 static int w_mutex_destroy(pthread_mutex_t *m) { g_mutex_destroyed++; return pthread_mutex_destroy(m); }
+static void *g_watch_mutex;             /* a mutex whose locks are counted (S24) */
+static int g_watched_locks;
+static int w_mutex_lock(pthread_mutex_t *m) {
+  if (m == g_watch_mutex) __atomic_fetch_add(&g_watched_locks, 1, __ATOMIC_SEQ_CST);
+  return pthread_mutex_lock(m);
+}
 static int w_condattr_setclock(pthread_condattr_t *a, clockid_t c) { g_cond_clock = (int) c; return pthread_condattr_setclock(a, c); }
 static int w_cond_destroy(pthread_cond_t *c) { g_cond_destroyed++; return pthread_cond_destroy(c); }
 static int w_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
@@ -140,6 +146,7 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #define pthread_mutex_destroy w_mutex_destroy
 #define pthread_cond_destroy w_cond_destroy
 #define pthread_condattr_setclock w_condattr_setclock
+#define pthread_mutex_lock w_mutex_lock
 #include "../libpinedio-usb.c"
 #undef pthread_create
 #undef pthread_join
@@ -149,6 +156,7 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #undef pthread_mutex_destroy
 #undef pthread_cond_destroy
 #undef pthread_condattr_setclock
+#undef pthread_mutex_lock
 #include "fake_helpers.h"
 
 /* ---- fixtures ------------------------------------------------------------------------------------------------ */
@@ -644,6 +652,22 @@ static void s23(void) {
   close_inst(inst);
 }
 
+/* S24: a second deinit after a completed one returns 0 and touches neither the destroyed mutex nor the
+ * condvar (counted locks on the instance's mutex: 0). A deinit that was refused stays retryable (S16). Before,
+ * the second deinit locked the destroyed mutex. */
+static void s24(void) {
+  struct pinedio_inst *inst = open_inst();
+  assert(pinedio_deinit(inst) == 0);
+  g_watch_mutex = &inst->usb_access_mutex;
+  int destroyed = g_mutex_destroyed;
+  assert(pinedio_deinit(inst) == 0);
+  printf("     S24: locks of the destroyed mutex by the second deinit: %d\n", g_watched_locks);
+  fflush(stdout);
+  assert(g_watched_locks == 0 && g_mutex_destroyed == destroyed);
+  g_watch_mutex = NULL;
+  free(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -857,6 +881,7 @@ int main(int argc, char **argv) {
     {"S21 a failed IN submit is not cancelled", s21},
     {"S22 a failed cancel waits for the callback", s22},
     {"S23 rejected attach/detach arguments leave no call counted", s23},
+    {"S24 a second deinit touches no destroyed sync object", s24},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

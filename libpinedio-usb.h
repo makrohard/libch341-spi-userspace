@@ -70,6 +70,7 @@ struct pinedio_inst {
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
   bool closing;                      /* deinit has begun: every later call is refused */
+  bool closed;                       /* deinit ran to the end: the sync objects are gone; deinit again returns 0 */
   int api_active;                    /* calls between their entry and their last unlock (atomic) */
   struct pinedio_inst_int interrupts[PINEDIO_INT_PIN_MAX];
   uint32_t options[PINEDIO_OPTION_MAX];

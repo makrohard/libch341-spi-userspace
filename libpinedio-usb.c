@@ -308,6 +308,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   for (int i = 0; i < USB_IN_TRANSFERS; i++)
     inst->transfer_ins[i] = NULL;
   inst->worker_started = false;
+  inst->closed = false;
   inst->int_running_cnt = 0;
   for (int i = 0; i < PINEDIO_INT_PIN_MAX; i++) {
     inst->interrupts[i].callback = NULL;
@@ -798,6 +799,8 @@ int32_t pinedio_deattach_interrupt(struct pinedio_inst *inst, enum pinedio_int_p
 /* 0: closed, the instance may be freed. -1: refused (called from a poll callback); nothing was released and the
  * caller must not free the instance. */
 int32_t pinedio_deinit(struct pinedio_inst *inst) {
+  if (inst->closed)
+    return 0;   /* closed already: its mutex and condvar are destroyed, nothing to do */
   if (inst->worker_started && pthread_equal(pthread_self(), inst->pin_poll_thread)) {
     fprintf(stderr, "pinedio_deinit: called from a poll callback, refused\n");
     return -1;
@@ -849,5 +852,6 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
   }
   pthread_cond_destroy(&inst->poll_cond);
   pthread_mutex_destroy(&inst->usb_access_mutex);
+  inst->closed = true;   /* only a teardown that ran to the end: a refused one (-1) stays retryable */
   return 0;
 }
