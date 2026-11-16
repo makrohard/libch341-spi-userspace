@@ -292,37 +292,32 @@ static void s3(void) {
   free(inst);
 }
 
-/* S3b, through the public path (a callback is the caller's own code; no library hook): 10 re-attaches, an edge,
- * the callback that receives it blocks; deinit starts. When deinit enters its join, this process must hold
- * exactly main, the deinit thread and one worker. On 98b656bf the 10 re-attaches left 10 poll threads (12 in
- * all), whichever of them got the edge. */
-static struct hold H_cb;
-static void cb_hold(void) { hold_point(&H_cb); }
+/* S3b, through the public path (no library hook; the fake's event handling is the hold point): 10
+ * re-attaches; every poller that enters the fake's handle_events is held there (its read in progress). While
+ * held, this process holds main and exactly one poller; at 98b656bf it held 10 pollers (11 threads). Then the
+ * pollers are released, deinit returns and only main is left. No edge and no previous state are involved. */
+static pthread_t g_main_thread;
+static struct hold H_poller;
+static void poller_on_events(void) { if (!pthread_equal(pthread_self(), g_main_thread)) hold_point(&H_poller); }
 static void s3b(void) {
   devices(1);
   g_fake_io_ok = 1;
+  g_main_thread = pthread_self();
   struct pinedio_inst *inst = calloc(1, sizeof(*inst));
   *inst = fresh(NULL);
   assert(pinedio_init(inst, NULL) == 0);
   for (int k = 0; k < 10; k++)
-    assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING | PINEDIO_INT_MODE_FALLING, cb_hold) == 0);
-  arm(&H_cb);
-  set_input(0);
-  /* every attach reset the pin's previous state. A poller commits it (0) after its read, before its next read:
-   * 12 handle_events after the last attach are more than one per poller (at most 11 here), so some poller entered
-   * twice, and its first read after the attach has been committed. Then one change is an edge. */
-  int ev0 = __atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST);
-  while (__atomic_load_n(&g_fake_events, __ATOMIC_SEQ_CST) < ev0 + 12) sched_yield();
-  set_input(1);
-  wait_arrived(&H_cb);
-  pthread_t h = start_deinit(inst);
-  wait_event(EV_JOIN_ENTER);
+    assert(pinedio_attach_interrupt(inst, PINEDIO_PIN_D0, PINEDIO_INT_MODE_RISING, cb_a) == 0);
+  arm(&H_poller);
+  __atomic_store_n(&g_fake_on_events, poller_on_events, __ATOMIC_SEQ_CST);
+  wait_arrived(&H_poller);                        /* a poller is held inside its read */
   int during = live_threads();
-  printf("     S3b: threads while deinit joins %d\n", during);
+  printf("     S3b: threads while a poller is held in its read %d\n", during);
   fflush(stdout);
-  assert(during == 3);
-  release(&H_cb);
-  pthread_join(h, NULL);
+  assert(during == 2);
+  __atomic_store_n(&g_fake_on_events, NULL, __ATOMIC_SEQ_CST);
+  release(&H_poller);
+  assert(pinedio_deinit(inst) == 0);
   int after;
   while ((after = live_threads()) > 1) sched_yield();
   free(inst);
@@ -799,7 +794,7 @@ int main(int argc, char **argv) {
     {"S5 deinit waits for a counted caller", s5}, {"S6 callback attach during CLOSING refused", s6},
     {"S7 callback self-detach and re-attach", s7}, {"S8 read failure: sticky in_error, one line", s8},
     {"S9 spurious wakeups keep the deadline", s9}, {"S10 deinit from a callback refused", s10},
-    {"S3b public path: one worker while deinit joins", s3b},
+    {"S3b public path: one poller while one is held in its read", s3b},
     {"S8b transfer errors: bounded log", s8b},
     {"S11a init: libusb_init fails", s11a}, {"S11b init: no device", s11b},
     {"S11c init: condvar init fails", s11c}, {"S11d init: worker cannot start", s11d},
