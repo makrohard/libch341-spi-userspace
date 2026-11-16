@@ -615,7 +615,7 @@ static int32_t transceive_locked(struct pinedio_inst* inst, uint8_t *write_buf, 
 
   unsigned int i;
   for (i = 0; i < count; i++) {
-    *read_buf++ = reverse_byte(*read_buf);
+    read_buf[i] = reverse_byte(read_buf[i]);   /* was *read_buf++ = reverse_byte(*read_buf): unsequenced (UB) */
   }
 
   return 0;

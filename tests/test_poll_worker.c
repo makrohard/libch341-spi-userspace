@@ -550,6 +550,21 @@ static void s11f(void) {
   free(inst);
 }
 
+/* S18, through the public path: pinedio_transceive returns the received bytes bit-reversed (the CH341 shifts
+ * LSB first), each at its own index. */
+static void s18(void) {
+  struct pinedio_inst *inst = open_inst();
+  __atomic_store_n(&g_fake_in[0], 0x01, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_in[1], 0x02, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_in[2], 0xF0, __ATOMIC_SEQ_CST);
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == 0);
+  printf("     S18: %02x %02x %02x\n", r[0], r[1], r[2]);
+  fflush(stdout);
+  assert(r[0] == 0x80 && r[1] == 0x40 && r[2] == 0x0F);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -757,6 +772,7 @@ int main(int argc, char **argv) {
     {"S13b a call inside its transfer finishes before the free", s13b},
     {"S11e init: a transfer allocation fails (each position)", s11e},
     {"S11f init: uninitialised caller memory", s11f},
+    {"S18 transceive returns the bytes reversed, in order", s18},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
