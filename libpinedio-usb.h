@@ -58,7 +58,7 @@ struct pinedio_inst_int {
  * callback that comes late (after its call gave up waiting) writes into memory that still exists. */
 struct pinedio_xfer_state {
   int st;
-  bool quiet;
+  int status, actual;   /* what its callback saw, for the caller's report (status -1: no callback yet) */
 };
 
 struct pinedio_inst {

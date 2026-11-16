@@ -12,6 +12,8 @@ Userspace driver for [PINE64 LoRa USB Adapter](https://pine64.com/product/pinedi
   (also while a USB transfer whose callback did not come within the drain deadline is outstanding, or a call or
   a poll callback has not returned within that deadline: deinit never waits longer than it).
 - A USB request without progress for `PINEDIO_XFER_MS` (3 s) fails with -1 instead of waiting for ever.
+- The libusb callbacks only store a transfer's result; the failing call reports it after its wait
+  (`<function>: IN|OUT transfer: ...` instead of `cb_in:` / `cb_out:` lines).
 - A USB read error no longer ends the thread: `in_error` stays set until `pinedio_deinit`.
 - The pin mode and state are per device; `pinedio_d_mode` / `pinedio_d_state` are the template an open starts
   from (`pinedio_seed_pin_state`).

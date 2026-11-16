@@ -103,10 +103,8 @@ void pinedio_seed_pin_state(uint16_t mode_bits, uint16_t state_bits) {
 
 enum trans_state {TRANS_ACTIVE = -2, TRANS_ERR = -1, TRANS_IDLE = 0};
 
-/* A transfer's state (struct pinedio_xfer_state, in the instance). quiet: the poll worker reads with in_error
- * already set, so a gone device logs its first failure, not one per poll. The callback may run on any thread that
- * handles libusb events (the default context is shared by every instance), so the flag travels with the
- * transfer. */
+/* A transfer's state (struct pinedio_xfer_state, in the instance): st, and what the callback saw (status,
+ * actual length; status -1 until a callback ran) for the caller's report. */
 #define xfer_state pinedio_xfer_state
 
 #ifndef PINEDIO_DRAIN_MS
@@ -151,39 +149,47 @@ static int lock_until(pthread_mutex_t *m, const struct timespec *end) {
 #define ST_GET(ts) __atomic_load_n(&(ts).st, __ATOMIC_SEQ_CST)
 #define ST_SET(ts, v) __atomic_store_n(&(ts).st, (v), __ATOMIC_SEQ_CST)
 
-static void cb_common(const char* func, struct libusb_transfer *transfer) {
+/* A callback only stores. It runs on whichever thread handles libusb events (another instance's worker, too),
+ * and nothing in it may block that thread: a diagnostic on a stalled stderr held the event handler, so neither
+ * the transfer loop's nor the drain's deadline could end the wait. The caller reports after its wait. The
+ * terminal store is the callback's last access to its state. */
+static void cb_common(struct libusb_transfer *transfer) {
   struct xfer_state *ts = (struct xfer_state *) transfer->user_data;
-
-  if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
-    /* Silently: a cancelled transfer did not complete. TRANS_IDLE here read as "nothing to process" and hid
-     * an error in a later slot (the read then waited forever); the cleanup treats every non-ACTIVE state as
-     * finished, so TRANS_ERR ends a cancel there too. */
-    ST_SET(*ts, TRANS_ERR);
-    return;
-  }
-
-  if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
-    if (!ts->quiet) fprintf(stderr, "%s: error: %s\n", func, libusb_error_name(transfer->status));
-    ST_SET(*ts, TRANS_ERR);
-  } else if (transfer->actual_length != transfer->length) {
-    /* A short or zero-byte completion: usb_transfer counts whole transfers, so its loop would wait for the
-     * missing bytes forever with the USB mutex held. An error: the call cancels and drains the rest. */
-    if (!ts->quiet) fprintf(stderr, "%s: short transfer: %d of %d bytes\n", func, transfer->actual_length,
-                            transfer->length);
-    ST_SET(*ts, TRANS_ERR);
-  } else {
-    ST_SET(*ts, transfer->actual_length);
-  }
+  int st;
+  if (transfer->status != LIBUSB_TRANSFER_COMPLETED)
+    st = TRANS_ERR;   /* CANCELLED too: as TRANS_IDLE it read "nothing to process" and hid a later slot's error */
+  else if (transfer->actual_length != transfer->length)
+    st = TRANS_ERR;   /* short or zero-byte: usb_transfer counts whole transfers and would wait for the rest */
+  else
+    st = transfer->actual_length;
+  ts->status = transfer->status;
+  ts->actual = transfer->actual_length;
+  ST_SET(*ts, st);
 }
 
 // callback for bulk out async transfer
 static void LIBUSB_CALL cb_out(struct libusb_transfer *transfer) {
-  cb_common(__func__, transfer);
+  cb_common(transfer);
 }
 
 // callback for bulk in async transfer
 static void LIBUSB_CALL cb_in(struct libusb_transfer *transfer) {
-  cb_common(__func__, transfer);
+  cb_common(transfer);
+}
+
+/* The first transfer of the request that failed by itself (not cancelled by the cleanup), for the report. */
+static void report_failed(const char *func, struct pinedio_inst *inst) {
+  for (int i = -1; i < USB_IN_TRANSFERS; i++) {
+    struct xfer_state *ts = i < 0 ? &inst->req_out : &inst->req_in[i];
+    struct libusb_transfer *t = i < 0 ? inst->transfer_out : inst->transfer_ins[i];
+    if (ST_GET(*ts) != TRANS_ERR || ts->status < 0 || ts->status == LIBUSB_TRANSFER_CANCELLED)
+      continue;
+    if (ts->status != LIBUSB_TRANSFER_COMPLETED)
+      fprintf(stderr, "%s: %s transfer: error: %s\n", func, i < 0 ? "OUT" : "IN", libusb_error_name(ts->status));
+    else
+      fprintf(stderr, "%s: %s transfer: short: %d of %d bytes\n", func, i < 0 ? "OUT" : "IN", ts->actual, t->length);
+    return;
+  }
 }
 
 /* The caller holds usb_access_mutex (a public call through PINEDIO_API, or the poll worker). func NULL: quiet. */
@@ -212,6 +218,8 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
                             const uint8_t *writearr, uint8_t *readarr)
 {
   bool stalled = false;   /* no transfer progressed within PINEDIO_XFER_MS */
+  int submit_err = 0;      /* a failed submit: its error, for the report */
+  const char *submit_dir = "";
   /* An abandoned request (a transfer whose callback did not come within the drain deadline) blocks every new one
    * until that callback has run: its states and buffers may still be written. */
   if (inst->req_abandoned) {
@@ -237,7 +245,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
 
   struct xfer_state *ts_outp = &inst->req_out, *ts_in = inst->req_in;
   ST_SET(*ts_outp, TRANS_IDLE);
-  ts_outp->quiet = func == NULL;
+  ts_outp->status = -1;
   inst->transfer_out->buffer = inst->req_buf_out;
   inst->transfer_out->length = writecnt;
   inst->transfer_out->user_data = ts_outp;
@@ -245,7 +253,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   /* Every IN state is set before the first submit: a failed OUT submit goes to the cleanup, which reads them. */
   for (unsigned int k = 0; k < USB_IN_TRANSFERS; k++) {
     ST_SET(ts_in[k], TRANS_IDLE);
-    ts_in[k].quiet = func == NULL;
+    ts_in[k].status = -1;
   }
 
   /* Schedule write first */
@@ -253,7 +261,8 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     ST_SET((*ts_outp), TRANS_ACTIVE);
     int ret = libusb_submit_transfer(inst->transfer_out);
     if (ret) {
-      if (func) fprintf(stderr, "%s: failed to submit OUT transfer: %s\n", func, libusb_error_name(ret));
+      submit_err = ret;
+      submit_dir = "OUT";
       ST_SET((*ts_outp), TRANS_ERR);
       goto err;
     }
@@ -285,8 +294,8 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       int ret = libusb_submit_transfer(inst->transfer_ins[free_idx]);
       if (ret) {
         ST_SET(ts_in[free_idx], TRANS_ERR);
-        if (func) fprintf(stderr, "%s: failed to submit IN transfer: %s\n",
-                 func, libusb_error_name(ret));
+        submit_err = ret;
+        submit_dir = "IN";
         goto err;
       }
       in_buf += cur_todo;
@@ -330,10 +339,8 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     memcpy(readarr, inst->req_buf_in, readcnt);
   return 0;
 err:
-  /* Clean up on errors. */
-  if (func && stalled) fprintf(stderr, "%s: no USB transfer progress within %d ms\n", func, PINEDIO_XFER_MS);
-  if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ST_GET((*ts_outp)) == TRANS_ERR) ? "write" : "read",
-           (ST_GET((*ts_outp)) == TRANS_ERR) ? writecnt : readcnt);
+  /* Clean up on errors. The report waits until the transfers are settled or abandoned (below). */
+  bool write_failed = ST_GET((*ts_outp)) == TRANS_ERR;
   /* First, we must cancel any ongoing requests and wait for them to be canceled. Only the callback publishes
    * the end of a submitted transfer: a cancel that fails (e.g. NOT_FOUND, the transfer is completing) changes
    * nothing, and the wait below runs until its callback has run. Marking it failed here let this call return
@@ -354,11 +361,22 @@ err:
    * possible, later calls are refused until it has run, and deinit returns -1 (retryable) meanwhile. */
   struct timespec drain_end;
   deadline_after(&drain_end, PINEDIO_DRAIN_MS);
-  if (!req_drain(inst, &drain_end)) {
+  bool drained = req_drain(inst, &drain_end);
+  if (!drained)
     inst->req_abandoned = true;
+  if (func) {
+    if (submit_err)
+      fprintf(stderr, "%s: failed to submit %s transfer: %s\n", func, submit_dir, libusb_error_name(submit_err));
+    else if (stalled)
+      fprintf(stderr, "%s: no USB transfer progress within %d ms\n", func, PINEDIO_XFER_MS);
+    else
+      report_failed(func, inst);
+    fprintf(stderr, "%s: Failed to %s %u bytes\n", func, write_failed ? "write" : "read",
+            write_failed ? writecnt : readcnt);
+  }
+  if (!drained)
     fprintf(stderr, "%s: a USB transfer did not end within %d ms: request abandoned\n",
             func ? func : "usb_transfer", PINEDIO_DRAIN_MS);
-  }
   return -1;
 }
 

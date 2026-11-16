@@ -5,6 +5,7 @@
  * and by records taken where a join or the library's mutex orders them. Run: tests/run.sh */
 #include "fake_libusb.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -930,6 +931,54 @@ static void s32b(void) {
   free(inst);
 }
 
+/* S33: a callback only stores its state: with stderr a full pipe (every write blocks), an error, a short and a
+ * cancelled completion each return and publish TRANS_ERR. A diagnostic written in the callback blocked the thread
+ * handling the events, and with it every deadline of the transfer loop and the drain. Red before: the error
+ * callback blocked in fprintf. */
+static int g_cb_done;
+static void *cb_in_thread(void *t) {
+  cb_in(t);
+  pthread_mutex_lock(&g_m); g_cb_done = 1; pthread_cond_broadcast(&g_c); pthread_mutex_unlock(&g_m);
+  return NULL;
+}
+static int callback_returns(enum libusb_transfer_status status, int actual) {
+  struct pinedio_xfer_state ts = { .st = TRANS_ACTIVE };
+  uint8_t buf[4] = {0};
+  struct libusb_transfer t = { .status = status, .length = 4, .actual_length = actual, .buffer = buf, .user_data = &ts };
+  g_cb_done = 0;
+  pthread_t th;
+  assert(pthread_create(&th, NULL, cb_in_thread, &t) == 0);
+  struct timespec at;
+  clock_gettime(CLOCK_REALTIME, &at);
+  at.tv_sec += 1;
+  pthread_mutex_lock(&g_m);
+  while (!g_cb_done && pthread_cond_timedwait(&g_c, &g_m, &at) != ETIMEDOUT) { }
+  int done = g_cb_done;
+  pthread_mutex_unlock(&g_m);
+  if (!done) return 0;                            /* blocked (the child ends; the thread stays blocked) */
+  pthread_join(th, NULL);
+  return ST_GET(ts) == TRANS_ERR;
+}
+static void s33(void) {
+  int p[2];
+  assert(pipe(p) == 0);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  assert(fcntl(p[1], F_SETFL, O_NONBLOCK) == 0);
+  while (write(p[1], junk, sizeof(junk)) > 0) { }
+  while (write(p[1], junk, 1) == 1) { }           /* the pipe is full */
+  assert(fcntl(p[1], F_SETFL, 0) == 0);           /* and blocking: the next write would wait for ever */
+  fflush(stderr);
+  int saved = dup(2);
+  dup2(p[1], 2);
+  int ok = callback_returns(LIBUSB_TRANSFER_NO_DEVICE, 0) && callback_returns(LIBUSB_TRANSFER_COMPLETED, 3) &&
+           callback_returns(LIBUSB_TRANSFER_CANCELLED, 0);
+  dup2(saved, 2);
+  printf("     S33: callbacks with a blocking stderr: %s\n", ok ? "all returned" : "one blocked");
+  fflush(stdout);
+  assert(ok);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -1058,8 +1107,8 @@ static void s16(void) {
   free(inst);
 }
 
-/* S17: the quiet log belongs to the transfer: A's worker polls a gone device quietly; B's failing transfer,
- * completed inside A's worker's handle_events (the shared default context), still logs its error. */
+/* S17: the quiet log belongs to the call: A's worker polls a gone device quietly; B's failing transfer,
+ * completed inside A's worker's handle_events (the shared default context), is still reported, by B's call. */
 static struct hold H_tb_events;
 static void tb_on_events(void) { if (is_tb()) hold_point(&H_tb_events); }
 static void *tb_read(void *arg) { register_self(&g_tb_thread, &g_tb_set); return (void *) (intptr_t) pinedio_digital_read(arg, 1); }
@@ -1091,9 +1140,10 @@ static void s17(void) {
   dup2(saved, 2);
   rewind(log);
   char line[256];
-  int cb_lines = 0;
-  while (fgets(line, sizeof(line), log)) if (!strncmp(line, "cb_", 3)) cb_lines++;
-  assert((intptr_t) rb < 0 && cb_lines >= 1);
+  int b_lines = 0;
+  while (fgets(line, sizeof(line), log))
+    if (!strncmp(line, "pinedio_digital_read: ", 22) && strstr(line, " transfer: error: ")) b_lines++;
+  assert((intptr_t) rb < 0 && b_lines >= 1);
   __atomic_store_n(&g_fake_fail_status, 0, __ATOMIC_SEQ_CST);
   assert(pinedio_deinit(a) == 0 && pinedio_deinit(b) == 0);
   free(a); free(b);
@@ -1155,6 +1205,7 @@ int main(int argc, char **argv) {
     {"S31 an IN callback that never comes: the call ends by its progress deadline", s31},
     {"S32a a caller blocked with the mutex: deinit -1 within its deadline", s32a},
     {"S32b a callback that does not return: deinit -1 within its deadline", s32b},
+    {"S33 a callback only stores: it never blocks on stderr", s33},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
