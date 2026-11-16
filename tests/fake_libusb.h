@@ -132,7 +132,8 @@ int libusb_submit_transfer(struct libusb_transfer *t) {
   pthread_mutex_unlock(&g_fake_qm);
   return 0;
 }
-int libusb_cancel_transfer(struct libusb_transfer *t) { (void) t; return 0; }
+static int g_fake_cancels;
+int libusb_cancel_transfer(struct libusb_transfer *t) { (void) t; __atomic_fetch_add(&g_fake_cancels, 1, __ATOMIC_SEQ_CST); return 0; }
 int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
   (void) c; (void) tv;
   void (*on_events)(void) = __atomic_load_n(&g_fake_on_events, __ATOMIC_SEQ_CST);

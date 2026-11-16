@@ -579,6 +579,28 @@ static void s19(void) {
   close_inst(inst);
 }
 
+/* S20, through the public path: the OUT submit of a read fails (a disconnect during an SPI read). The cleanup
+ * looks only at IN transfers this call submitted: none here, so nothing is cancelled and the call returns -1.
+ * The stack is sprayed with TRANS_ACTIVE first: an IN state read before it was set looks active, the cleanup
+ * cancels it and waits forever (the alarm). Without -ftrivial-auto-var-init the spray reaches the old code's
+ * uninitialised states; with it (tests/run.sh) this is a regression case. */
+static __attribute__((noinline)) void spray_stack(void) {
+  volatile int a[4096];
+  for (int i = 0; i < 4096; i++) a[i] = TRANS_ACTIVE;
+  (void) a[0];
+}
+static void s20(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  __atomic_store_n(&g_fake_fail, 1, __ATOMIC_SEQ_CST);
+  int cancels = g_fake_cancels;
+  spray_stack();
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  assert(g_fake_cancels == cancels);
+  __atomic_store_n(&g_fake_fail, 0, __ATOMIC_SEQ_CST);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -788,6 +810,7 @@ int main(int argc, char **argv) {
     {"S11f init: uninitialised caller memory", s11f},
     {"S18 transceive returns the bytes reversed, in order", s18},
     {"S19 an IN transfer completed inside its submit", s19},
+    {"S20 an OUT submit failure reads no unset IN state", s20},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

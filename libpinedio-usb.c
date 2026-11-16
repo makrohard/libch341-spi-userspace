@@ -150,6 +150,13 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   inst->transfer_out->length = writecnt;
   inst->transfer_out->user_data = &ts_out;
 
+  /* Every IN state is set before the first submit: a failed OUT submit goes to the cleanup, which reads them. */
+  struct xfer_state ts_in[USB_IN_TRANSFERS];
+  for (unsigned int k = 0; k < USB_IN_TRANSFERS; k++) {
+    ST_SET(ts_in[k], TRANS_IDLE);
+    ts_in[k].quiet = func == NULL;
+  }
+
   /* Schedule write first */
   if (writecnt > 0) {
     ST_SET(ts_out, TRANS_ACTIVE);
@@ -169,11 +176,6 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   unsigned int in_active = 0;
   unsigned int out_done = 0;
   uint8_t *in_buf = readarr;
-  struct xfer_state ts_in[USB_IN_TRANSFERS];
-  for (unsigned int k = 0; k < USB_IN_TRANSFERS; k++) {
-    ST_SET(ts_in[k], TRANS_IDLE);
-    ts_in[k].quiet = func == NULL;
-  }
   do {
     /* Schedule new reads as long as there are free transfers and unscheduled bytes to read. */
     while ((in_done + in_active) < readcnt && ST_GET(ts_in[free_idx]) == TRANS_IDLE) {
