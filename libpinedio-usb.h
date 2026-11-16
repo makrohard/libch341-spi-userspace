@@ -54,6 +54,13 @@ struct pinedio_inst_int {
 /* Even this will work mostly on desktop (so malloc is available), I still prefer static allocation.
  * That's why structure definition is in header. */
 
+/* One USB request's transfer state (see usb_transfer): owned by the instance, not by a call's stack frame, so a
+ * callback that comes late (after its call gave up waiting) writes into memory that still exists. */
+struct pinedio_xfer_state {
+  int st;
+  bool quiet;
+};
+
 struct pinedio_inst {
   struct libusb_device_handle *handle;
 
@@ -67,6 +74,13 @@ struct pinedio_inst {
   pthread_t pin_poll_thread;         /* the poll worker: started by init, joined by deinit */
   bool in_error;                     /* set by the first failed poll; stays set until deinit; read with __atomic_load_n */
   uint16_t d_mode, d_state;          /* this device's pin mode and state (D0-D7), from the template at init */
+  /* The one outstanding USB request (calls are serialised by the mutex): its transfer states and its bounce
+   * buffers. abandoned: a transfer of it did not end within the drain deadline; nothing of it is reused or
+   * freed until its callback has run. */
+  struct pinedio_xfer_state req_out, req_in[USB_IN_TRANSFERS];
+  uint8_t *req_buf_out, *req_buf_in;
+  uint32_t req_cap_out, req_cap_in;
+  bool req_abandoned;
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
   bool closing;                      /* deinit has begun: every later call is refused */

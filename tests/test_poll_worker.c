@@ -138,6 +138,7 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 }
 
 #define PINEDIO_TEST_HOOK(name) test_hook(#name)
+#define PINEDIO_DRAIN_MS 200   /* the cleanup's drain deadline, short for S30 */
 #define pthread_create w_create
 #define pthread_join w_join
 #define pthread_cond_wait w_cond_wait
@@ -616,6 +617,8 @@ static void s21(void) {
   assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
   __atomic_store_n(&g_fake_fail_in, 0, __ATOMIC_SEQ_CST);
   assert(__atomic_load_n(&g_fake_cancels, __ATOMIC_SEQ_CST) == cancels + 1);
+  /* the next read starts from fresh transfer states (the request lives in the instance): it succeeds */
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == 0);
   close_inst(inst);
 }
 
@@ -804,6 +807,34 @@ static void s29(void) {
   __atomic_store_n(&g_fake_out_short_at, 1, __ATOMIC_SEQ_CST);
   assert(pinedio_init(inst, NULL) == -3);
   __atomic_store_n(&g_fake_out_short_at, 0, __ATOMIC_SEQ_CST);
+  free(inst);
+}
+
+/* S30 (the gate-2 round 2 case), through the public path: a read whose IN submit fails; the cancel of its
+ * submitted OUT transfer fails and that transfer never completes. The call returns -1 after the drain deadline
+ * (the request is abandoned) instead of waiting forever with the USB mutex held. While the transfer is
+ * outstanding every call is refused without USB traffic and deinit returns -1 releasing nothing; once its
+ * callback can come (the fake releases it), deinit drains it and returns 0. Red before: the read never
+ * returned (the child's alarm). */
+static void s30(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  __atomic_store_n(&g_fake_hold_out, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_fail_in, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  assert(inst->req_abandoned);
+  __atomic_store_n(&g_fake_fail_in, 0, __ATOMIC_SEQ_CST);
+  int submits = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);           /* refused while outstanding */
+  assert(__atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST) == submits);
+  int freed = g_fake_freed;
+  assert(pinedio_deinit(inst) == -1);                                 /* nothing released, retryable */
+  assert(g_fake_freed == freed && g_devs[0].closed == 0 && !inst->closed);
+  __atomic_store_n(&g_fake_hold_out, 0, __ATOMIC_SEQ_CST);           /* its callback can come now */
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_deinit(inst) == 0 && inst->closed && g_devs[0].closed == 1);
   free(inst);
 }
 
@@ -1028,6 +1059,7 @@ int main(int argc, char **argv) {
     {"S27 a cancelled IN completion is an error, not nothing", s27},
     {"S28 a zero-length transfer is refused before any buffer", s28},
     {"S29 the CS writes around a transfer and in init are checked", s29},
+    {"S30 a transfer whose callback never comes: bounded, abandoned, retryable", s30},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

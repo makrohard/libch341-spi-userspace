@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -99,14 +100,15 @@ void pinedio_seed_pin_state(uint16_t mode_bits, uint16_t state_bits) {
 
 enum trans_state {TRANS_ACTIVE = -2, TRANS_ERR = -1, TRANS_IDLE = 0};
 
-/* A transfer's state, owned by the usb_transfer call that submitted it. quiet: the poll worker reads with in_error
- * already set, so a gone device logs its first failure, not one per poll. The callback may run on any thread
- * that handles libusb events (the default context is shared by every instance), so the flag travels with the
- * transfer. st is the first member: &ts == &ts.st. */
-struct xfer_state {
-  int st;
-  bool quiet;
-};
+/* A transfer's state (struct pinedio_xfer_state, in the instance). quiet: the poll worker reads with in_error
+ * already set, so a gone device logs its first failure, not one per poll. The callback may run on any thread that
+ * handles libusb events (the default context is shared by every instance), so the flag travels with the
+ * transfer. */
+#define xfer_state pinedio_xfer_state
+
+#ifndef PINEDIO_DRAIN_MS
+#define PINEDIO_DRAIN_MS 3000   /* the cleanup waits at most this long for its transfers' callbacks */
+#endif
 
 /* st is written by whichever thread handles the libusb events (another instance's worker, too) and read by the
  * usb_transfer call that owns it: every access is atomic. */
@@ -149,17 +151,66 @@ static void LIBUSB_CALL cb_in(struct libusb_transfer *transfer) {
 }
 
 /* The caller holds usb_access_mutex (a public call through PINEDIO_API, or the poll worker). func NULL: quiet. */
+/* The request has no transfer in flight: every state is past ACTIVE. */
+static bool req_settled(struct pinedio_inst *inst) {
+  if (ST_GET(inst->req_out) == TRANS_ACTIVE)
+    return false;
+  for (int i = 0; i < USB_IN_TRANSFERS; i++)
+    if (ST_GET(inst->req_in[i]) == TRANS_ACTIVE)
+      return false;
+  return true;
+}
+
+/* Handle libusb events until the request is settled or PINEDIO_DRAIN_MS (monotonic) have passed. */
+static bool req_drain(struct pinedio_inst *inst) {
+  struct timespec now, end;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  end.tv_sec += PINEDIO_DRAIN_MS / 1000;
+  end.tv_nsec += (long) (PINEDIO_DRAIN_MS % 1000) * 1000000L;
+  if (end.tv_nsec >= 1000000000L) { end.tv_sec++; end.tv_nsec -= 1000000000L; }
+  while (!req_settled(inst)) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec))
+      return false;
+    libusb_handle_events_timeout(NULL, &(struct timeval){0, 100000});
+  }
+  return true;
+}
+
 static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigned int writecnt, unsigned int readcnt,
                             const uint8_t *writearr, uint8_t *readarr)
 {
-  struct xfer_state ts_out = { TRANS_IDLE, func == NULL };
+  /* An abandoned request (a transfer whose callback did not come within the drain deadline) blocks every new one
+   * until that callback has run: its states and buffers may still be written. */
+  if (inst->req_abandoned) {
+    if (!req_settled(inst))
+      return -1;
+    inst->req_abandoned = false;
+  }
+  /* The bounce buffers: a late callback writes into the instance, never into a caller's frame. */
+  if (writecnt > inst->req_cap_out) {
+    uint8_t *b = realloc(inst->req_buf_out, writecnt);
+    if (!b) return -1;
+    inst->req_buf_out = b;
+    inst->req_cap_out = writecnt;
+  }
+  if (readcnt > inst->req_cap_in) {
+    uint8_t *b = realloc(inst->req_buf_in, readcnt);
+    if (!b) return -1;
+    inst->req_buf_in = b;
+    inst->req_cap_in = readcnt;
+  }
+  if (writecnt > 0)
+    memcpy(inst->req_buf_out, writearr, writecnt);
 
-  inst->transfer_out->buffer = (uint8_t*)writearr;
+  struct xfer_state *ts_outp = &inst->req_out, *ts_in = inst->req_in;
+  ST_SET(*ts_outp, TRANS_IDLE);
+  ts_outp->quiet = func == NULL;
+  inst->transfer_out->buffer = inst->req_buf_out;
   inst->transfer_out->length = writecnt;
-  inst->transfer_out->user_data = &ts_out;
+  inst->transfer_out->user_data = ts_outp;
 
   /* Every IN state is set before the first submit: a failed OUT submit goes to the cleanup, which reads them. */
-  struct xfer_state ts_in[USB_IN_TRANSFERS];
   for (unsigned int k = 0; k < USB_IN_TRANSFERS; k++) {
     ST_SET(ts_in[k], TRANS_IDLE);
     ts_in[k].quiet = func == NULL;
@@ -167,11 +218,11 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
 
   /* Schedule write first */
   if (writecnt > 0) {
-    ST_SET(ts_out, TRANS_ACTIVE);
+    ST_SET((*ts_outp), TRANS_ACTIVE);
     int ret = libusb_submit_transfer(inst->transfer_out);
     if (ret) {
       if (func) fprintf(stderr, "%s: failed to submit OUT transfer: %s\n", func, libusb_error_name(ret));
-      ST_SET(ts_out, TRANS_ERR);
+      ST_SET((*ts_outp), TRANS_ERR);
       goto err;
     }
   }
@@ -183,7 +234,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   unsigned int in_done = 0;
   unsigned int in_active = 0;
   unsigned int out_done = 0;
-  uint8_t *in_buf = readarr;
+  uint8_t *in_buf = inst->req_buf_in;
   do {
     /* Schedule new reads as long as there are free transfers and unscheduled bytes to read. */
     while ((in_done + in_active) < readcnt && ST_GET(ts_in[free_idx]) == TRANS_IDLE) {
@@ -211,11 +262,11 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
 
     /* Check for the write */
     if (out_done < writecnt) {
-      if (ST_GET(ts_out) == TRANS_ERR) {
+      if (ST_GET((*ts_outp)) == TRANS_ERR) {
         goto err;
-      } else if (ST_GET(ts_out) > 0) {
-        out_done += ST_GET(ts_out);
-        ST_SET(ts_out, TRANS_IDLE);
+      } else if (ST_GET((*ts_outp)) > 0) {
+        out_done += ST_GET((*ts_outp));
+        ST_SET((*ts_outp), TRANS_IDLE);
       }
     }
     /* Check for completed transfers. */
@@ -231,16 +282,18 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     }
   } while ((out_done < writecnt) || (in_done < readcnt));
 
+  if (readcnt > 0)
+    memcpy(readarr, inst->req_buf_in, readcnt);
   return 0;
 err:
   /* Clean up on errors. */
-  if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ST_GET(ts_out) == TRANS_ERR) ? "write" : "read",
-           (ST_GET(ts_out) == TRANS_ERR) ? writecnt : readcnt);
+  if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ST_GET((*ts_outp)) == TRANS_ERR) ? "write" : "read",
+           (ST_GET((*ts_outp)) == TRANS_ERR) ? writecnt : readcnt);
   /* First, we must cancel any ongoing requests and wait for them to be canceled. Only the callback publishes
    * the end of a submitted transfer: a cancel that fails (e.g. NOT_FOUND, the transfer is completing) changes
    * nothing, and the wait below runs until its callback has run. Marking it failed here let this call return
    * while the callback was still to write into this stack frame. */
-  if ((writecnt > 0) && (ST_GET(ts_out) == TRANS_ACTIVE)) {
+  if ((writecnt > 0) && (ST_GET((*ts_outp)) == TRANS_ACTIVE)) {
     (void) libusb_cancel_transfer(inst->transfer_out);
   }
   if (readcnt > 0) {
@@ -251,21 +304,13 @@ err:
     }
   }
 
-  /* Wait for cancellations to complete. */
-  while (1) {
-    bool finished = true;
-    if ((writecnt > 0) && (ST_GET(ts_out) == TRANS_ACTIVE))
-      finished = false;
-    if (readcnt > 0) {
-      unsigned int i;
-      for (i = 0; i < USB_IN_TRANSFERS; i++) {
-        if (ST_GET(ts_in[i]) == TRANS_ACTIVE)
-          finished = false;
-      }
-    }
-    if (finished)
-      break;
-    libusb_handle_events_timeout(NULL, &(struct timeval){1, 0});
+  /* Wait for the callbacks, at most PINEDIO_DRAIN_MS in all. A transfer whose callback does not come (a failed
+   * cancel, a broken backend) abandons the request: nothing of it is reused or freed while that callback is
+   * possible, later calls are refused until it has run, and deinit returns -1 (retryable) meanwhile. */
+  if (!req_drain(inst)) {
+    inst->req_abandoned = true;
+    fprintf(stderr, "%s: a USB transfer did not end within %d ms: request abandoned\n",
+            func ? func : "usb_transfer", PINEDIO_DRAIN_MS);
   }
   return -1;
 }
@@ -313,6 +358,12 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
    * paths and deinit look at is set here, first. */
   inst->handle = NULL;
   inst->transfer_out = NULL;
+  inst->req_buf_out = inst->req_buf_in = NULL;
+  inst->req_cap_out = inst->req_cap_in = 0;
+  inst->req_abandoned = false;
+  inst->req_out.st = TRANS_IDLE;
+  for (int i = 0; i < USB_IN_TRANSFERS; i++)
+    inst->req_in[i].st = TRANS_IDLE;
   for (int i = 0; i < USB_IN_TRANSFERS; i++)
     inst->transfer_ins[i] = NULL;
   inst->worker_started = false;
@@ -846,6 +897,14 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
   pthread_mutex_unlock(&inst->usb_access_mutex);
   PINEDIO_TEST_HOOK(deinit_past_wait);
 
+  /* An abandoned request may still be called back: give it one more bounded drain, and free nothing (-1,
+   * retryable) if its callback still has not come. */
+  if (inst->req_abandoned && !req_drain(inst)) {
+    fprintf(stderr, "pinedio_deinit: a USB transfer is still outstanding, nothing released\n");
+    return -1;
+  }
+  inst->req_abandoned = false;
+
   for (int i = 0; i < USB_IN_TRANSFERS; i++) {
     if (inst->transfer_ins[i] != NULL) {
       libusb_free_transfer(inst->transfer_ins[i]);
@@ -866,6 +925,10 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
     libusb_close(inst->handle);
     inst->handle = NULL;
   }
+  free(inst->req_buf_out);
+  free(inst->req_buf_in);
+  inst->req_buf_out = inst->req_buf_in = NULL;
+  inst->req_cap_out = inst->req_cap_in = 0;
   pthread_cond_destroy(&inst->poll_cond);
   pthread_mutex_destroy(&inst->usb_access_mutex);
   inst->closed = true;   /* only a teardown that ran to the end: a refused one (-1) stays retryable */
