@@ -228,17 +228,18 @@ err:
   /* Clean up on errors. */
   if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ST_GET(ts_out) == TRANS_ERR) ? "write" : "read",
            (ST_GET(ts_out) == TRANS_ERR) ? writecnt : readcnt);
-  /* First, we must cancel any ongoing requests and wait for them to be canceled. */
+  /* First, we must cancel any ongoing requests and wait for them to be canceled. Only the callback publishes
+   * the end of a submitted transfer: a cancel that fails (e.g. NOT_FOUND, the transfer is completing) changes
+   * nothing, and the wait below runs until its callback has run. Marking it failed here let this call return
+   * while the callback was still to write into this stack frame. */
   if ((writecnt > 0) && (ST_GET(ts_out) == TRANS_ACTIVE)) {
-    if (libusb_cancel_transfer(inst->transfer_out) != 0)
-      ST_SET(ts_out, TRANS_ERR);
+    (void) libusb_cancel_transfer(inst->transfer_out);
   }
   if (readcnt > 0) {
     unsigned int i;
     for (i = 0; i < USB_IN_TRANSFERS; i++) {
       if (ST_GET(ts_in[i]) == TRANS_ACTIVE)
-        if (libusb_cancel_transfer(inst->transfer_ins[i]) != 0)
-          ST_SET(ts_in[i], TRANS_ERR);
+        (void) libusb_cancel_transfer(inst->transfer_ins[i]);
     }
   }
 

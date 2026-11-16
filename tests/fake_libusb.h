@@ -135,7 +135,13 @@ int libusb_submit_transfer(struct libusb_transfer *t) {
   return 0;
 }
 static int g_fake_cancels;
-int libusb_cancel_transfer(struct libusb_transfer *t) { (void) t; __atomic_fetch_add(&g_fake_cancels, 1, __ATOMIC_SEQ_CST); return 0; }
+static int g_fake_cancel_not_found;     /* cancel answers NOT_FOUND; the transfer completes in the next events */
+int libusb_cancel_transfer(struct libusb_transfer *t) {
+  (void) t;
+  __atomic_fetch_add(&g_fake_cancels, 1, __ATOMIC_SEQ_CST);
+  return __atomic_load_n(&g_fake_cancel_not_found, __ATOMIC_SEQ_CST) ? LIBUSB_ERROR_NOT_FOUND : 0;
+}
+static int fake_queued(void) { pthread_mutex_lock(&g_fake_qm); int n = g_fake_nq; pthread_mutex_unlock(&g_fake_qm); return n; }
 int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
   (void) c; (void) tv;
   void (*on_events)(void) = __atomic_load_n(&g_fake_on_events, __ATOMIC_SEQ_CST);

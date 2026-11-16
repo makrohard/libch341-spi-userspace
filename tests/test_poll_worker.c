@@ -611,6 +611,27 @@ static void s21(void) {
   close_inst(inst);
 }
 
+/* S22, through the public path: a read whose IN submit fails, so its submitted OUT transfer must be cancelled,
+ * and the cancel answers NOT_FOUND (the transfer is completing). The call returns -1 only after that
+ * transfer's callback has run: when it returns, no transfer of it is still queued. Marking the transfer failed
+ * on the cancel error returned with the OUT transfer still queued; its callback would then write into the
+ * returned call's stack. */
+static void s22(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);   /* no CS write after the read drains it */
+  __atomic_store_n(&g_fake_fail_in, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  int rc = pinedio_transceive(inst, w, r, sizeof(r));
+  int queued = fake_queued();
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_fail_in, 0, __ATOMIC_SEQ_CST);
+  printf("     S22: rc %d, still queued at return %d\n", rc, queued);
+  fflush(stdout);
+  assert(rc == -1 && queued == 0);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -822,6 +843,7 @@ int main(int argc, char **argv) {
     {"S19 an IN transfer completed inside its submit", s19},
     {"S20 an OUT submit failure reads no unset IN state", s20},
     {"S21 a failed IN submit is not cancelled", s21},
+    {"S22 a failed cancel waits for the callback", s22},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
