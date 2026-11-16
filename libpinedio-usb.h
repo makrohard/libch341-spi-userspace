@@ -112,7 +112,8 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * pine64's library: detaching the last pin no longer stops and joins the poll thread; it stays (idle on a
  * condvar) until deinit. A callback runs on the worker without the library's mutex; it may attach and detach,
  * it must not deinit (refused, -1). A callback the worker took before a detach may still run once after that
- * detach returned. After deinit has begun, every call is refused (-1). attach refuses a NULL callback.
+ * detach returned. After deinit has begun, every call on the instance except pinedio_set_option is refused
+ * (-1). attach refuses a NULL callback.
  *
  * What pinedio_deinit returning 0 guarantees, exactly: the worker has terminated (joined); every call that was
  * counted (from its first statement) has made its last access to the instance; no callback runs any more; the
@@ -123,8 +124,11 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * a call or the worker (a callback) that has not returned, or a USB transfer whose callback has not come):
  * nothing was released, deinit may be called again. deinit never blocks longer than that deadline (on glibc;
  * elsewhere its first lock of the mutex is unbounded). A USB request whose transfers make no progress for
- * PINEDIO_XFER_MS fails (-1) and is cancelled. While such a transfer is
- * outstanding every call is refused (-1). */
+ * PINEDIO_XFER_MS fails (-1) and is cancelled; if a cancelled transfer's callback then does not come within
+ * PINEDIO_DRAIN_MS, the request is abandoned. While an abandoned request's transfer is outstanding, a call that
+ * needs a USB transfer (digital_write, set_cs, digital_read, get_irq_state, a non-empty write_read or transceive,
+ * the worker's poll) returns -1 without one; set_pin_mode, attach, detach, set_option and an empty write_read or
+ * transceive work as usual (they need no transfer); deinit returns -1 (above). */
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
 /* 0: closed, the instance may be freed (see above). -1: refused (see above): nothing released, retryable. */
