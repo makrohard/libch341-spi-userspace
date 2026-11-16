@@ -742,6 +742,24 @@ static void rejected_call_counted(void *(*fn)(void *)) {
 static void s26a(void) { rejected_call_counted(d_attach_bad); }
 static void s26b(void) { rejected_call_counted(d_detach_bad); }
 
+/* S27 (the gate-2 round 2 case), through the public path: a 40-byte read has two IN transfers queued; the
+ * first completes CANCELLED, the second with an error. The call returns -1. With CANCELLED stored as
+ * TRANS_IDLE the completion processing stopped at the first slot, never saw the second slot's error, and the
+ * read waited forever with the USB mutex held (the child's alarm). */
+static void s27(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[40] = {0}, r[40] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  g_fake_in_status[0] = LIBUSB_TRANSFER_CANCELLED;
+  g_fake_in_status[1] = LIBUSB_TRANSFER_NO_DEVICE;
+  __atomic_store_n(&g_fake_in_status_i, 0, __ATOMIC_SEQ_CST);
+  g_fake_in_status_n = 2;
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  g_fake_in_status_n = 0;
+  assert(__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -960,6 +978,7 @@ int main(int argc, char **argv) {
     {"S25 a short or zero-byte completion is an error", s25},
     {"S26a a rejected attach is counted before its check", s26a},
     {"S26b a rejected detach is counted before its check", s26b},
+    {"S27 a cancelled IN completion is an error, not nothing", s27},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

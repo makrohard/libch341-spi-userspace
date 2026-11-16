@@ -121,6 +121,8 @@ static int g_fake_fail_in_after;       /* > 0: IN submits after that many fail (
 static int g_fake_in_submits;
 static int g_fake_complete_in_submit;  /* complete an IN transfer inside submit (another thread's events) */
 static int g_fake_complete_out_in_submit;   /* the same for an OUT transfer */
+static enum libusb_transfer_status g_fake_in_status[8];   /* IN completions' statuses, in order */
+static int g_fake_in_status_n, g_fake_in_status_i;
 static void fake_complete(struct libusb_transfer *t);
 int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
@@ -170,6 +172,10 @@ void libusb_exit(libusb_context *c) { (void) c; }
 static void fake_complete(struct libusb_transfer *t) {
     t->status = __atomic_load_n(&g_fake_fail_status, __ATOMIC_SEQ_CST) ? LIBUSB_TRANSFER_NO_DEVICE
                                                                        : LIBUSB_TRANSFER_COMPLETED;
+    if ((t->endpoint & 0x80) && g_fake_in_status_n > 0) {     /* a scripted status per IN completion */
+      int k = __atomic_fetch_add(&g_fake_in_status_i, 1, __ATOMIC_SEQ_CST);
+      if (k < g_fake_in_status_n) t->status = g_fake_in_status[k];
+    }
     int short_mode = __atomic_load_n(&g_fake_short, __ATOMIC_SEQ_CST);   /* 1: zero bytes, 2: one short */
     t->actual_length = (t->endpoint & 0x80) && short_mode ? (short_mode == 1 ? 0 : t->length - 1) : t->length;
     if (t->endpoint & 0x80)

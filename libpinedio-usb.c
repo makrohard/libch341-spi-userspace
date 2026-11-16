@@ -117,8 +117,10 @@ static void cb_common(const char* func, struct libusb_transfer *transfer) {
   struct xfer_state *ts = (struct xfer_state *) transfer->user_data;
 
   if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
-    // Silently ACK and exit.
-    ST_SET(*ts, TRANS_IDLE);
+    /* Silently: a cancelled transfer did not complete. TRANS_IDLE here read as "nothing to process" and hid
+     * an error in a later slot (the read then waited forever); the cleanup treats every non-ACTIVE state as
+     * finished, so TRANS_ERR ends a cancel there too. */
+    ST_SET(*ts, TRANS_ERR);
     return;
   }
 
