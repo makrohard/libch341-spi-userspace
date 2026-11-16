@@ -296,6 +296,13 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
 
 int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char *port_path) {
   int32_t ret;
+  /* The instance is caller memory and may be uninitialised (upstream's test.c): every pointer the error
+   * paths and deinit look at is set here, first. */
+  inst->handle = NULL;
+  inst->transfer_out = NULL;
+  for (int i = 0; i < USB_IN_TRANSFERS; i++)
+    inst->transfer_ins[i] = NULL;
+  inst->worker_started = false;
   inst->int_running_cnt = 0;
   for (int i = 0; i < PINEDIO_INT_PIN_MAX; i++) {
     inst->interrupts[i].callback = NULL;

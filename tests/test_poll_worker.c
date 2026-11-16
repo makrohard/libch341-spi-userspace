@@ -529,6 +529,27 @@ static void s11d(void) {
   assert(g_devs[0].closed == 1 && g_fake_freed == USB_IN_TRANSFERS + 1);
 }
 
+/* S11f: an instance that is uninitialised caller memory (upstream's test.c passes a stack struct as is): its
+ * pointer fields hold garbage. With no device init returns -2; with an IN transfer that cannot be allocated it
+ * returns -3 and frees only what it allocated. Neither path looks at the garbage. */
+static void s11f_garbage(struct pinedio_inst *inst) {
+  memset(inst, 0xA5, sizeof(*inst));
+  memset(inst->options, 0, sizeof(inst->options));
+  memset(inst->serial_number, 0, sizeof(inst->serial_number));
+  inst->options[PINEDIO_OPTION_VID] = 0x1A86;
+  inst->options[PINEDIO_OPTION_PID] = 0x5512;
+}
+static void s11f(void) {
+  struct pinedio_inst *inst = malloc(sizeof(*inst));
+  devices(0); g_fake_io_ok = 1;
+  s11f_garbage(inst);
+  assert(pinedio_init(inst, NULL) == -2);
+  devices(1); g_fake_allocs = 0; g_fake_alloc_fail_at = 1; g_fake_freed = 0;   /* OUT ok, IN[0] fails */
+  s11f_garbage(inst);
+  assert(pinedio_init(inst, NULL) == -3 && g_fake_freed == 1 && g_devs[0].closed == 1);
+  free(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -735,6 +756,7 @@ int main(int argc, char **argv) {
     {"S13a a call after CLOSING is refused, no device access", s13a},
     {"S13b a call inside its transfer finishes before the free", s13b},
     {"S11e init: a transfer allocation fails (each position)", s11e},
+    {"S11f init: uninitialised caller memory", s11f},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
