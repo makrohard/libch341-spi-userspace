@@ -760,6 +760,22 @@ static void s27(void) {
   close_inst(inst);
 }
 
+/* S28, through the public path: a zero-length transceive or write_read is refused with -EINVAL before any
+ * stack buffer is sized and before any USB traffic, and leaves no call counted. Before, the zero-length call was
+ * accepted (rc 0): write_read cleared 32 bytes of a zero-size buffer, transceive declared a zero-size one (the
+ * gate-2 round found both with ASan/UBSan; no sanitizer runtime links on this host, so the contract is the
+ * assertion here). */
+static void s28(void) {
+  struct pinedio_inst *inst = open_inst();
+  int submits = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST);
+  uint8_t b[1] = {0};
+  assert(pinedio_transceive(inst, b, b, 0) == -EINVAL);
+  assert(pinedio_write_read(inst, NULL, 0, NULL, 0) == -EINVAL);
+  assert(__atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST) == submits);
+  assert(__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -979,6 +995,7 @@ int main(int argc, char **argv) {
     {"S26a a rejected attach is counted before its check", s26a},
     {"S26b a rejected detach is counted before its check", s26b},
     {"S27 a cancelled IN completion is an error, not nothing", s27},
+    {"S28 a zero-length transfer is refused before any buffer", s28},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
