@@ -108,21 +108,25 @@ struct xfer_state {
   bool quiet;
 };
 
+/* st is written by whichever thread handles the libusb events (another instance's worker, too) and read by the
+ * usb_transfer call that owns it: every access is atomic. */
+#define ST_GET(ts) __atomic_load_n(&(ts).st, __ATOMIC_SEQ_CST)
+#define ST_SET(ts, v) __atomic_store_n(&(ts).st, (v), __ATOMIC_SEQ_CST)
+
 static void cb_common(const char* func, struct libusb_transfer *transfer) {
   struct xfer_state *ts = (struct xfer_state *) transfer->user_data;
-  int* transfer_cnt = &ts->st;
 
   if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
     // Silently ACK and exit.
-    *transfer_cnt = TRANS_IDLE;
+    ST_SET(*ts, TRANS_IDLE);
     return;
   }
 
   if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
     if (!ts->quiet) fprintf(stderr, "%s: error: %s\n", func, libusb_error_name(transfer->status));
-    *transfer_cnt = TRANS_ERR;
+    ST_SET(*ts, TRANS_ERR);
   } else {
-    *transfer_cnt = transfer->actual_length;
+    ST_SET(*ts, transfer->actual_length);
   }
 }
 
@@ -144,15 +148,15 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
 
   inst->transfer_out->buffer = (uint8_t*)writearr;
   inst->transfer_out->length = writecnt;
-  inst->transfer_out->user_data = &ts_out.st;
+  inst->transfer_out->user_data = &ts_out;
 
   /* Schedule write first */
   if (writecnt > 0) {
-    ts_out.st = TRANS_ACTIVE;
+    ST_SET(ts_out, TRANS_ACTIVE);
     int ret = libusb_submit_transfer(inst->transfer_out);
     if (ret) {
       if (func) fprintf(stderr, "%s: failed to submit OUT transfer: %s\n", func, libusb_error_name(ret));
-      ts_out.st = TRANS_ERR;
+      ST_SET(ts_out, TRANS_ERR);
       goto err;
     }
   }
@@ -167,26 +171,26 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   uint8_t *in_buf = readarr;
   struct xfer_state ts_in[USB_IN_TRANSFERS];
   for (unsigned int k = 0; k < USB_IN_TRANSFERS; k++) {
-    ts_in[k].st = TRANS_IDLE;
+    ST_SET(ts_in[k], TRANS_IDLE);
     ts_in[k].quiet = func == NULL;
   }
   do {
     /* Schedule new reads as long as there are free transfers and unscheduled bytes to read. */
-    while ((in_done + in_active) < readcnt && ts_in[free_idx].st == TRANS_IDLE) {
+    while ((in_done + in_active) < readcnt && ST_GET(ts_in[free_idx]) == TRANS_IDLE) {
       unsigned int cur_todo = MIN(CH341_PACKET_LENGTH - 1, readcnt - in_done - in_active);
       inst->transfer_ins[free_idx]->length = cur_todo;
       inst->transfer_ins[free_idx]->buffer = in_buf;
-      inst->transfer_ins[free_idx]->user_data = &ts_in[free_idx].st;
+      inst->transfer_ins[free_idx]->user_data = &ts_in[free_idx];
       int ret = libusb_submit_transfer(inst->transfer_ins[free_idx]);
       if (ret) {
-        ts_in[free_idx].st = TRANS_ERR;
+        ST_SET(ts_in[free_idx], TRANS_ERR);
         if (func) fprintf(stderr, "%s: failed to submit IN transfer: %s\n",
                  func, libusb_error_name(ret));
         goto err;
       }
       in_buf += cur_todo;
       in_active += cur_todo;
-      ts_in[free_idx].st = TRANS_ACTIVE;
+      ST_SET(ts_in[free_idx], TRANS_ACTIVE);
       free_idx = (free_idx + 1) % USB_IN_TRANSFERS; /* Increment (and wrap around). */
     }
 
@@ -195,22 +199,22 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
 
     /* Check for the write */
     if (out_done < writecnt) {
-      if (ts_out.st == TRANS_ERR) {
+      if (ST_GET(ts_out) == TRANS_ERR) {
         goto err;
-      } else if (ts_out.st > 0) {
-        out_done += ts_out.st;
-        ts_out.st = TRANS_IDLE;
+      } else if (ST_GET(ts_out) > 0) {
+        out_done += ST_GET(ts_out);
+        ST_SET(ts_out, TRANS_IDLE);
       }
     }
     /* Check for completed transfers. */
-    while (ts_in[in_idx].st != TRANS_IDLE && ts_in[in_idx].st != TRANS_ACTIVE) {
-      if (ts_in[in_idx].st == TRANS_ERR) {
+    while (ST_GET(ts_in[in_idx]) != TRANS_IDLE && ST_GET(ts_in[in_idx]) != TRANS_ACTIVE) {
+      if (ST_GET(ts_in[in_idx]) == TRANS_ERR) {
         goto err;
       }
       /* If a transfer is done, record the number of bytes read and reuse it later. */
-      in_done += ts_in[in_idx].st;
-      in_active -= ts_in[in_idx].st;
-      ts_in[in_idx].st = TRANS_IDLE;
+      in_done += ST_GET(ts_in[in_idx]);
+      in_active -= ST_GET(ts_in[in_idx]);
+      ST_SET(ts_in[in_idx], TRANS_IDLE);
       in_idx = (in_idx + 1) % USB_IN_TRANSFERS; /* Increment (and wrap around). */
     }
   } while ((out_done < writecnt) || (in_done < readcnt));
@@ -218,31 +222,31 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
   return 0;
 err:
   /* Clean up on errors. */
-  if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ts_out.st == TRANS_ERR) ? "write" : "read",
-           (ts_out.st == TRANS_ERR) ? writecnt : readcnt);
+  if (func) fprintf(stderr, "%s: Failed to %s %d bytes\n", func, (ST_GET(ts_out) == TRANS_ERR) ? "write" : "read",
+           (ST_GET(ts_out) == TRANS_ERR) ? writecnt : readcnt);
   /* First, we must cancel any ongoing requests and wait for them to be canceled. */
-  if ((writecnt > 0) && (ts_out.st == TRANS_ACTIVE)) {
+  if ((writecnt > 0) && (ST_GET(ts_out) == TRANS_ACTIVE)) {
     if (libusb_cancel_transfer(inst->transfer_out) != 0)
-      ts_out.st = TRANS_ERR;
+      ST_SET(ts_out, TRANS_ERR);
   }
   if (readcnt > 0) {
     unsigned int i;
     for (i = 0; i < USB_IN_TRANSFERS; i++) {
-      if (ts_in[i].st == TRANS_ACTIVE)
+      if (ST_GET(ts_in[i]) == TRANS_ACTIVE)
         if (libusb_cancel_transfer(inst->transfer_ins[i]) != 0)
-          ts_in[i].st = TRANS_ERR;
+          ST_SET(ts_in[i], TRANS_ERR);
     }
   }
 
   /* Wait for cancellations to complete. */
   while (1) {
     bool finished = true;
-    if ((writecnt > 0) && (ts_out.st == TRANS_ACTIVE))
+    if ((writecnt > 0) && (ST_GET(ts_out) == TRANS_ACTIVE))
       finished = false;
     if (readcnt > 0) {
       unsigned int i;
       for (i = 0; i < USB_IN_TRANSFERS; i++) {
-        if (ts_in[i].st == TRANS_ACTIVE)
+        if (ST_GET(ts_in[i]) == TRANS_ACTIVE)
           finished = false;
       }
     }
