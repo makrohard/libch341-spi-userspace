@@ -103,6 +103,9 @@ int32_t pinedio_set_option(struct pinedio_inst* inst, enum pinedio_option option
 int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t mode);
 int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool active);
 int32_t pinedio_set_cs(struct pinedio_inst *inst, bool active);
+/* One write_read or transceive moves at most PINEDIO_SPI_MAX bytes (written + read); a longer one returns -1
+ * without a transfer. An empty one (0 bytes) is a no-op and returns 0. */
+#define PINEDIO_SPI_MAX 65536
 int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt);
 int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count);
 int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin);

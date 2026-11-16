@@ -680,8 +680,10 @@ static int32_t cs_assert_locked(struct pinedio_inst *inst) {
 }
 
 static int32_t write_read_locked(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt) {
-  if (writecnt + readcnt == 0)
+  if (writecnt == 0 && readcnt == 0)
     return 0;   /* a no-op: nothing to send or read; the stack buffers below would have no element */
+  if (writecnt > PINEDIO_SPI_MAX || readcnt > PINEDIO_SPI_MAX - writecnt)
+    return -1;  /* before any sum or product: nothing wraps around (32-bit size_t too), the stack buffers stay small */
   /* How many packets ... */
   const size_t packets = (writecnt + readcnt + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
 
@@ -739,6 +741,8 @@ int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_
 static int32_t transceive_locked(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count) {
   if (count == 0)
     return 0;   /* a no-op: nothing to send or read; the stack buffer below would have no element */
+  if (count > PINEDIO_SPI_MAX)
+    return -1;  /* before any product: nothing wraps around, the stack buffer stays small */
   const size_t packets = (count + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
 
   uint8_t wbuf[packets*CH341_PACKET_LENGTH];

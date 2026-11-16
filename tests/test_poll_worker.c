@@ -785,6 +785,22 @@ static void s28(void) {
   close_inst(inst);
 }
 
+/* S28b, through the public path: write_read with 0x80000000 + 0x80000000 bytes (the 32-bit sum is 0) returns -1,
+ * not the empty operation's 0; an operation over PINEDIO_SPI_MAX bytes returns -1; none sends anything or leaves
+ * a call counted. Before, the wrapped sum passed the empty-operation guard and returned 0. */
+static void s28b(void) {
+  struct pinedio_inst *inst = open_inst();
+  int submits = __atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST);
+  uint8_t b[1] = {0};
+  assert(pinedio_write_read(inst, b, 0x80000000u, b, 0x80000000u) == -1);
+  assert(pinedio_write_read(inst, b, PINEDIO_SPI_MAX, b, 1) == -1);
+  assert(pinedio_write_read(inst, b, 1, b, 0xFFFFFFFFu) == -1);
+  assert(pinedio_transceive(inst, b, b, PINEDIO_SPI_MAX + 1) == -1);
+  assert(__atomic_load_n(&g_fake_submits, __ATOMIC_SEQ_CST) == submits);
+  assert(__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
+  close_inst(inst);
+}
+
 /* S29, through the public path: the CS writes around an SPI transfer are checked. With AUTO_CS a transceive is
  * three OUT transfers (CS assert, the SPI stream, CS release). (a) The assert completes short: the call returns -1,
  * sends no SPI stream and still releases CS (the short assertion can have reached the device). (b) The release completes short after a good transfer: -1. (c) init's initial CS write
@@ -1228,6 +1244,7 @@ int main(int argc, char **argv) {
     {"S26b a rejected detach is counted before its check", s26b},
     {"S27 a cancelled IN completion is an error, not nothing", s27},
     {"S28 a zero-length transfer is a no-op before any buffer", s28},
+    {"S28b a wrapped or oversized SPI length is refused, not a no-op", s28b},
     {"S29 the CS writes around a transfer and in init are checked", s29},
     {"S29d a refused CS release goes out before the next assertion", s29d},
     {"S30 a transfer whose callback never comes: bounded, abandoned, retryable", s30},

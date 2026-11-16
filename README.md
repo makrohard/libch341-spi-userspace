@@ -14,6 +14,8 @@ Userspace driver for [PINE64 LoRa USB Adapter](https://pine64.com/product/pinedi
 - A USB request without progress for `PINEDIO_XFER_MS` (3 s) fails with -1 instead of waiting for ever.
 - The libusb callbacks only store a transfer's result; the failing call reports it after its wait
   (`<function>: IN|OUT transfer: ...` instead of `cb_in:` / `cb_out:` lines).
+- One `pinedio_write_read` / `pinedio_transceive` moves at most `PINEDIO_SPI_MAX` (65536) bytes; a longer one
+  returns -1 without a transfer. An empty one returns 0.
 - A USB read error no longer ends the thread: `in_error` stays set until `pinedio_deinit`.
 - The pin mode and state are per device; `pinedio_d_mode` / `pinedio_d_state` are the template an open starts
   from (`pinedio_seed_pin_state`).
