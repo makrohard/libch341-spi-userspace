@@ -125,6 +125,12 @@ static void cb_common(const char* func, struct libusb_transfer *transfer) {
   if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
     if (!ts->quiet) fprintf(stderr, "%s: error: %s\n", func, libusb_error_name(transfer->status));
     ST_SET(*ts, TRANS_ERR);
+  } else if (transfer->actual_length != transfer->length) {
+    /* A short or zero-byte completion: usb_transfer counts whole transfers, so its loop would wait for the
+     * missing bytes forever with the USB mutex held. An error: the call cancels and drains the rest. */
+    if (!ts->quiet) fprintf(stderr, "%s: short transfer: %d of %d bytes\n", func, transfer->actual_length,
+                            transfer->length);
+    ST_SET(*ts, TRANS_ERR);
   } else {
     ST_SET(*ts, transfer->actual_length);
   }

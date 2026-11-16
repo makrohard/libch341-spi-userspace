@@ -668,6 +668,21 @@ static void s24(void) {
   free(inst);
 }
 
+/* S25, through the public path: an IN transfer that completes with no byte, or one byte short. The call
+ * returns -1 (an error, its other transfers drained); it waited for the missing bytes forever before, with the
+ * USB mutex held (the child's alarm). */
+static void s25(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  for (int mode = 1; mode <= 2; mode++) {
+    __atomic_store_n(&g_fake_short, mode, __ATOMIC_SEQ_CST);
+    assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  }
+  __atomic_store_n(&g_fake_short, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == 0);   /* whole completions work again */
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -882,6 +897,7 @@ int main(int argc, char **argv) {
     {"S22 a failed cancel waits for the callback", s22},
     {"S23 rejected attach/detach arguments leave no call counted", s23},
     {"S24 a second deinit touches no destroyed sync object", s24},
+    {"S25 a short or zero-byte completion is an error", s25},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

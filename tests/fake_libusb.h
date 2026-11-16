@@ -115,6 +115,7 @@ void libusb_free_transfer(struct libusb_transfer *t) {
   __atomic_fetch_add(&g_fake_freed, 1, __ATOMIC_SEQ_CST);
   if (g_fake_io_ok) free(t);
 }
+static int g_fake_short;               /* IN transfers complete with 0 bytes (1) or one byte short (2) */
 static int g_fake_fail_in;             /* every IN submit fails (the OUT one goes through) */
 static int g_fake_complete_in_submit;  /* complete an IN transfer inside submit (another thread's events) */
 static void fake_complete(struct libusb_transfer *t);
@@ -162,7 +163,8 @@ void libusb_exit(libusb_context *c) { (void) c; }
 static void fake_complete(struct libusb_transfer *t) {
     t->status = __atomic_load_n(&g_fake_fail_status, __ATOMIC_SEQ_CST) ? LIBUSB_TRANSFER_NO_DEVICE
                                                                        : LIBUSB_TRANSFER_COMPLETED;
-    t->actual_length = t->length;
+    int short_mode = __atomic_load_n(&g_fake_short, __ATOMIC_SEQ_CST);   /* 1: zero bytes, 2: one short */
+    t->actual_length = (t->endpoint & 0x80) && short_mode ? (short_mode == 1 ? 0 : t->length - 1) : t->length;
     if (t->endpoint & 0x80)
       for (int k = 0; k < t->length && k < 3; k++) t->buffer[k] = __atomic_load_n(&g_fake_in[k], __ATOMIC_SEQ_CST);
     t->callback(t);
