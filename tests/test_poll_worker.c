@@ -208,6 +208,19 @@ static pthread_t start_deinit(struct pinedio_inst *inst) {
   return t;
 }
 
+static long ms_since(const struct timespec *t0) {
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  return (long) ((t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000);
+}
+/* A failing call that ends by its error, not by the progress deadline (PINEDIO_XFER_MS). */
+static int fails_at_once(struct pinedio_inst *inst, uint8_t *w, uint8_t *r, uint32_t n) {
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int rc = pinedio_transceive(inst, w, r, n);
+  return rc == -1 && ms_since(&t0) < PINEDIO_XFER_MS;
+}
+
 /* ---- cases --------------------------------------------------------------------------------------------------- */
 
 /* S0, through the public path only (no hook, no wrapper): the threads alive in this process. After init and 10
@@ -378,9 +391,14 @@ static void s5(void) {
   arm(&H_api_entered);                            /* held only for D (it registers itself first) */
   assert(pthread_create(&d, NULL, d_thread, inst) == 0);
   wait_arrived(&H_api_entered);                   /* D is counted, not yet locked */
+  int waits = ev_n(EV_DEINIT_COND_WAIT);
   release(&H_before_cb);                          /* the worker calls cb_a, sees closing, exits */
   wait_event(EV_WORKER_EXIT);
-  assert(!ev_n(EV_DEINIT_PAST_WAIT));             /* the worker is gone, D is counted: deinit still waits */
+  pthread_mutex_lock(&g_m);                       /* deinit, woken by the worker's exit, waits again or passes */
+  while (g_ev_n[EV_DEINIT_COND_WAIT] <= waits && !g_ev_n[EV_DEINIT_PAST_WAIT]) pthread_cond_wait(&g_c, &g_m);
+  int past = g_ev_n[EV_DEINIT_PAST_WAIT];
+  pthread_mutex_unlock(&g_m);
+  assert(!past);                                  /* the worker is gone, D is counted: deinit still waits */
   release(&H_api_entered);
   pthread_join(d, NULL);
   pthread_join(h, NULL);
@@ -686,7 +704,7 @@ static void s25(void) {
   uint8_t w[3] = {0}, r[3] = {0};
   for (int mode = 1; mode <= 2; mode++) {
     __atomic_store_n(&g_fake_short, mode, __ATOMIC_SEQ_CST);
-    assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+    assert(fails_at_once(inst, w, r, sizeof(r)));   /* the short completion is the error, not a stall */
   }
   __atomic_store_n(&g_fake_short, 0, __ATOMIC_SEQ_CST);
   assert(pinedio_transceive(inst, w, r, sizeof(r)) == 0);   /* whole completions work again */
@@ -764,7 +782,7 @@ static void s27(void) {
   g_fake_in_status[1] = LIBUSB_TRANSFER_NO_DEVICE;
   __atomic_store_n(&g_fake_in_status_i, 0, __ATOMIC_SEQ_CST);
   g_fake_in_status_n = 2;
-  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  assert(fails_at_once(inst, w, r, sizeof(r)));     /* the second slot's error is seen, not a stall */
   g_fake_in_status_n = 0;
   assert(__atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
   close_inst(inst);
@@ -893,11 +911,6 @@ static void s30(void) {
  * progress deadline (PINEDIO_XFER_MS), cancels, drains for PINEDIO_DRAIN_MS and abandons the request instead of
  * waiting forever with the USB mutex held; deinit returns -1 while the transfer is outstanding and 0 once its
  * callback has come. Red before: the read never returned (the child's alarm). */
-static long ms_since(const struct timespec *t0) {
-  struct timespec t1;
-  clock_gettime(CLOCK_MONOTONIC, &t1);
-  return (long) ((t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000);
-}
 static void s31(void) {
   struct pinedio_inst *inst = open_inst();
   uint8_t w[3] = {0}, r[3] = {0};
