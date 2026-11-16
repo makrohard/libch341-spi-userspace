@@ -66,6 +66,7 @@ struct pinedio_inst {
   pthread_mutex_t usb_access_mutex;  /* every USB transfer, the pin table and the fields below */
   pthread_t pin_poll_thread;         /* the poll worker: started by init, joined by deinit */
   bool in_error;                     /* set by the first failed poll; stays set until deinit; read with __atomic_load_n */
+  uint16_t d_mode, d_state;          /* this device's pin mode and state (D0-D7), from the template at init */
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
   bool closing;                      /* deinit has begun: every later call is refused */
@@ -101,7 +102,8 @@ int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
 /* 0: closed, the instance may be freed. -1: refused (called from a poll callback): nothing released, do not free. */
 int32_t pinedio_deinit(struct pinedio_inst* inst);
-/* OR bits into the process-wide pin mode and state (before an open that must keep a line, e.g. RESET, high). */
+/* OR bits into the pin mode and state every later open starts with (e.g. to keep RESET high on an open);
+ * an open device keeps its own copy. pinedio_d_mode / pinedio_d_state are that template. */
 void pinedio_seed_pin_state(uint16_t mode_bits, uint16_t state_bits);
 
 #ifdef __cplusplus

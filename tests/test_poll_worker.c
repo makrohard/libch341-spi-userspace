@@ -37,12 +37,10 @@ static void release(struct hold *h) { pthread_mutex_lock(&g_m); h->released = 1;
 
 /* named events: the sequence number of the first occurrence, and counts */
 enum { EV_WORKER_EXIT, EV_DEINIT_ENTERED, EV_JOIN_ENTER, EV_JOIN_RETURN, EV_DEINIT_COND_WAIT, EV_DEINIT_PAST_WAIT,
-       EV_API_EXIT_D, EV_CB_A, EV_CB_B, EV_API_ENTERED, EV_PIN_LOCK_TB, EV_PIN_HELD_TB, EV_TA_RELEASED, EV_MAX };
+       EV_API_EXIT_D, EV_CB_A, EV_CB_B, EV_API_ENTERED, EV_MAX };
 static int g_ev_seq[EV_MAX], g_ev_n[EV_MAX], g_polls;
-static pthread_t g_deinit_thread, g_d_thread, g_ta_thread, g_tb_thread;
-static int g_deinit_thread_set, g_d_thread_set, g_ta_set, g_tb_set;
-static void *g_watch_mutex;             /* the library's pin-state mutex, set after the include */
-static struct hold H_pin;
+static pthread_t g_deinit_thread, g_d_thread, g_tb_thread;
+static int g_deinit_thread_set, g_d_thread_set, g_tb_set;
 
 static void event(int e) {
   pthread_mutex_lock(&g_m);
@@ -69,7 +67,6 @@ static int is_thread(pthread_t *t, int *set) {
   return r;
 }
 static int is_deinit_thread(void) { return is_thread(&g_deinit_thread, &g_deinit_thread_set); }
-static int is_ta(void) { return is_thread(&g_ta_thread, &g_ta_set); }
 static int is_tb(void) { return is_thread(&g_tb_thread, &g_tb_set); }
 static void register_self(pthread_t *t, int *set) {
   pthread_mutex_lock(&g_m); *t = pthread_self(); *set = 1; pthread_mutex_unlock(&g_m);
@@ -87,7 +84,6 @@ static void test_hook(const char *name) {
     hold_point(&H_in_read);
   } else if (!strcmp(name, "before_callbacks")) hold_point(&H_before_cb);
   else if (!strcmp(name, "api_entered")) { event(EV_API_ENTERED); if (is_d_thread()) hold_point(&H_api_entered); }
-  else if (!strcmp(name, "pin_state_held")) { if (is_ta()) hold_point(&H_pin); else if (is_tb()) event(EV_PIN_HELD_TB); }
   else if (!strcmp(name, "api_exit")) { if (is_d_thread()) event(EV_API_EXIT_D); }
   else if (!strcmp(name, "worker_exit")) event(EV_WORKER_EXIT);
   else if (!strcmp(name, "deinit_entered")) event(EV_DEINIT_ENTERED);
@@ -118,10 +114,6 @@ static int w_cond_init(pthread_cond_t *c, const pthread_condattr_t *a) {
   return pthread_cond_init(c, a);
 }
 static int w_mutex_destroy(pthread_mutex_t *m) { g_mutex_destroyed++; return pthread_mutex_destroy(m); }
-static int w_mutex_lock(pthread_mutex_t *m) {
-  if (m == g_watch_mutex && is_tb()) event(EV_PIN_LOCK_TB);
-  return pthread_mutex_lock(m);
-}
 static int w_condattr_setclock(pthread_condattr_t *a, clockid_t c) { g_cond_clock = (int) c; return pthread_condattr_setclock(a, c); }
 static int w_cond_destroy(pthread_cond_t *c) { g_cond_destroyed++; return pthread_cond_destroy(c); }
 static int w_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
@@ -147,7 +139,6 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #define pthread_cond_init w_cond_init
 #define pthread_mutex_destroy w_mutex_destroy
 #define pthread_cond_destroy w_cond_destroy
-#define pthread_mutex_lock w_mutex_lock
 #define pthread_condattr_setclock w_condattr_setclock
 #include "../libpinedio-usb.c"
 #undef pthread_create
@@ -157,7 +148,6 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #undef pthread_cond_init
 #undef pthread_mutex_destroy
 #undef pthread_cond_destroy
-#undef pthread_mutex_lock
 #undef pthread_condattr_setclock
 #include "fake_helpers.h"
 
@@ -611,33 +601,32 @@ static void s11e(void) {
   }
 }
 
-/* S14: the process-wide pin state: a pin write on device B waits while device A's write holds it. */
+/* S14, through the public path: each device has its own pin mode and state. A pin written or made an output
+ * on device A is not in device B's next UIO command; a seed reaches only devices opened after it. On 98b656bf
+ * (and 8d609e90) the pin state was process-wide: A's pin 1 showed up in B's command. */
 static struct pinedio_inst *open_at(const char *port) {
   struct pinedio_inst *inst = calloc(1, sizeof(*inst));
   *inst = fresh(NULL);
   assert(pinedio_init_at_port(inst, NULL, port) == 0);
   return inst;
 }
-static void *ta_write(void *arg) { register_self(&g_ta_thread, &g_ta_set); return (void *) (intptr_t) pinedio_digital_write(arg, 1, true); }
-static void *tb_write(void *arg) { register_self(&g_tb_thread, &g_tb_set); return (void *) (intptr_t) pinedio_digital_write(arg, 2, true); }
 static void s14(void) {
-  devices(2); g_fake_io_ok = 1;
-  g_watch_mutex = &pin_state_mutex;
+  devices(3); g_fake_io_ok = 1;
   struct pinedio_inst *a = open_at("1-1.1"), *b = open_at("1-1.2");
-  arm(&H_pin);
-  pthread_t ta, tb;
-  assert(pthread_create(&ta, NULL, ta_write, a) == 0);
-  wait_arrived(&H_pin);                           /* A holds the pin state */
-  assert(pthread_create(&tb, NULL, tb_write, b) == 0);
-  assert(wait_either(EV_PIN_LOCK_TB, EV_PIN_HELD_TB) == EV_PIN_LOCK_TB);   /* B goes for the lock first */
-  event(EV_TA_RELEASED);
-  release(&H_pin);
-  void *ra, *rb;
-  pthread_join(ta, &ra); pthread_join(tb, &rb);
-  assert((intptr_t) ra == 0 && (intptr_t) rb == 0);
-  assert(g_ev_seq[EV_TA_RELEASED] < g_ev_seq[EV_PIN_HELD_TB]);
-  assert(pinedio_deinit(a) == 0 && pinedio_deinit(b) == 0);
-  free(a); free(b);
+  assert(pinedio_set_pin_mode(a, 4, 1) == 0 && pinedio_digital_write(a, 1, true) == 0);
+  assert(pinedio_digital_write(b, 2, true) == 0);
+  uint8_t st_b = g_fake_last_out[1][1], dir_b = g_fake_last_out[1][2];   /* 0x80|state, 0x40|mode */
+  printf("     S14: B state 0x%02x dir 0x%02x\n", st_b, dir_b);
+  fflush(stdout);
+  assert((st_b & (1u << 2)) && !(st_b & (1u << 1)));    /* B's own pin 2; not A's pin 1 */
+  assert(!(dir_b & (1u << 4)));                          /* not A's output pin 4 */
+  pinedio_seed_pin_state(1u << 5, 1u << 5);              /* a template bit: only later opens get it */
+  assert(pinedio_digital_write(b, 2, true) == 0 && !(g_fake_last_out[1][1] & (1u << 5)));
+  struct pinedio_inst *c = open_at("1-1.3");
+  assert(pinedio_digital_write(c, 3, true) == 0);
+  assert((g_fake_last_out[2][1] & (1u << 5)) && (g_fake_last_out[2][2] & (1u << 5)));
+  assert(pinedio_deinit(a) == 0 && pinedio_deinit(b) == 0 && pinedio_deinit(c) == 0);
+  free(a); free(b); free(c);
 }
 
 /* S15 (the documented contract): a callback the worker took before a non-final detach still runs once after
@@ -746,7 +735,7 @@ int main(int argc, char **argv) {
     {"S13a a call after CLOSING is refused, no device access", s13a},
     {"S13b a call inside its transfer finishes before the free", s13b},
     {"S11e init: a transfer allocation fails (each position)", s11e},
-    {"S14 the process-wide pin state is held across devices", s14},
+    {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
     {"S17 the quiet log belongs to the transfer", s17},

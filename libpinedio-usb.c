@@ -85,9 +85,9 @@ static void api_exit(struct pinedio_inst *inst) {
 // store mode and state of d0-d7
 uint16_t pinedio_d_mode = 0;
 uint16_t pinedio_d_state = 0;
-/* The pin mode and state are process-wide (upstream's design; a caller may seed them before an open, see
- * pinedio_seed_pin_state). Every read-modify-write and every command built from them holds this mutex, inside
- * an instance's mutex, never the other way round. */
+/* The pin mode and state each device starts with (a template). init copies it into the device's own
+ * d_mode/d_state; every later write changes only that device's copy, under its mutex. A caller may seed the
+ * template before an open (pinedio_seed_pin_state), e.g. to keep RESET high. This lock guards the template. */
 static pthread_mutex_t pin_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void pinedio_seed_pin_state(uint16_t mode_bits, uint16_t state_bits) {
@@ -318,6 +318,10 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
     return -1;
   }
   inst->worker_started = false;
+  pthread_mutex_lock(&pin_state_mutex);   /* this device starts from the template */
+  inst->d_mode = pinedio_d_mode;
+  inst->d_state = pinedio_d_state;
+  pthread_mutex_unlock(&pin_state_mutex);
   inst->closing = false;
   inst->api_active = 0;
   inst->int_running_cnt = 0;
@@ -464,26 +468,14 @@ int32_t pinedio_set_option(struct pinedio_inst *inst, enum pinedio_option option
   return 0;
 }
 
+/* The mode reaches the device with the next pin write (the direction is in every UIO command). */
 static int32_t set_pin_mode_locked(struct pinedio_inst *inst, uint32_t pin, uint32_t mode) {
-  pthread_mutex_lock(&pin_state_mutex);
   if (mode == 1) { // output
-    pinedio_d_mode |= (1 << pin);
+    inst->d_mode |= (1 << pin);
   } else {
-    pinedio_d_mode &= ~(1 << pin);
+    inst->d_mode &= ~(1 << pin);
   }
-  pthread_mutex_unlock(&pin_state_mutex);
-  uint8_t buf[] = {
-          CH341_CMD_UIO_STREAM,
-          CH341_CMD_UIO_STM_DIR | pinedio_d_mode, // enable output on d0-d5
-          CH341_CMD_UIO_STM_END
-  };
-
-  (void) buf;
-  int32_t ret = 0; //usb_transfer(inst, __func__, sizeof(buf), 0, buf, NULL);
-  if (ret < 0) {
-    printf("Failed to set CS pin.\n");
-  }
-  return ret;
+  return 0;
 }
 
 int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t mode) {
@@ -491,20 +483,17 @@ int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t m
 }
 
 static int32_t digital_write_locked(struct pinedio_inst *inst, uint32_t pin, bool active) {
-  pthread_mutex_lock(&pin_state_mutex);
   if (active) {
-    pinedio_d_state |= (1 << pin);
+    inst->d_state |= (1 << pin);
   } else {
-    pinedio_d_state &= ~(1 << pin);
+    inst->d_state &= ~(1 << pin);
   }
-  PINEDIO_TEST_HOOK(pin_state_held);
     uint8_t buf[] = {
           CH341_CMD_UIO_STREAM,
-          CH341_CMD_UIO_STM_OUT | pinedio_d_state,  // bitfield controlling value of d0-d7 where the rightmost bit is d0
-          CH341_CMD_UIO_STM_DIR | pinedio_d_mode,
+          CH341_CMD_UIO_STM_OUT | inst->d_state,  // bitfield controlling value of d0-d7 where the rightmost bit is d0
+          CH341_CMD_UIO_STM_DIR | inst->d_mode,
           CH341_CMD_UIO_STM_END
   };
-  pthread_mutex_unlock(&pin_state_mutex);
 
   int32_t ret = usb_transfer(inst, "pinedio_digital_write", sizeof(buf), 0, buf, NULL);
   if (ret < 0) {

@@ -93,6 +93,7 @@ static int g_fake_fail;                 /* atomic: set by the test while the wor
 static uint8_t g_fake_in[3];            /* atomic bytes: the input word the next IN transfer returns */
 static int g_fake_freed;                /* transfers freed */
 static int g_fake_submits;              /* submits that reached the device */
+static uint8_t g_fake_last_out[4][4];   /* per device: the first 4 bytes of its last OUT transfer */
 static int g_fake_fail_status;          /* atomic: queued transfers complete with LIBUSB_TRANSFER_NO_DEVICE */
 static void (*g_fake_on_events)(void);  /* called at the start of every handle_events (a test hold point) */
 static struct libusb_transfer *g_fake_q[4 * (8 + 1)];
@@ -118,6 +119,8 @@ int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
   __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);
   pthread_mutex_lock(&g_fake_qm);
+  if (!(t->endpoint & 0x80) && t->dev_handle)
+    memcpy(g_fake_last_out[t->dev_handle->idx], t->buffer, t->length < 4 ? (size_t) t->length : 4);
   g_fake_q[g_fake_nq++] = t;
   pthread_mutex_unlock(&g_fake_qm);
   return 0;
