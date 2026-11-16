@@ -566,6 +566,19 @@ static void s18(void) {
   close_inst(inst);
 }
 
+/* S19, through the public path: an IN transfer that completes before its submit returns (another instance's
+ * worker can handle the events first). The call returns its data; marking the transfer active after the
+ * submit overwrote the completion and the call waited forever (the child's alarm). */
+static void s19(void) {
+  struct pinedio_inst *inst = open_inst();
+  __atomic_store_n(&g_fake_in[0], 0x01, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_complete_in_submit, 1, __ATOMIC_SEQ_CST);
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == 0 && r[0] == 0x80);
+  __atomic_store_n(&g_fake_complete_in_submit, 0, __ATOMIC_SEQ_CST);
+  close_inst(inst);
+}
+
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
 static void s12(void) {
   struct pinedio_inst *inst = open_inst();
@@ -774,6 +787,7 @@ int main(int argc, char **argv) {
     {"S11e init: a transfer allocation fails (each position)", s11e},
     {"S11f init: uninitialised caller memory", s11f},
     {"S18 transceive returns the bytes reversed, in order", s18},
+    {"S19 an IN transfer completed inside its submit", s19},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

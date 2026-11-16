@@ -181,6 +181,9 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       inst->transfer_ins[free_idx]->length = cur_todo;
       inst->transfer_ins[free_idx]->buffer = in_buf;
       inst->transfer_ins[free_idx]->user_data = &ts_in[free_idx];
+      /* ACTIVE before the submit: the transfer can complete on another thread's event handling (another
+       * instance's worker) before submit returns; marking it after would overwrite that completion. */
+      ST_SET(ts_in[free_idx], TRANS_ACTIVE);
       int ret = libusb_submit_transfer(inst->transfer_ins[free_idx]);
       if (ret) {
         ST_SET(ts_in[free_idx], TRANS_ERR);
@@ -190,7 +193,6 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       }
       in_buf += cur_todo;
       in_active += cur_todo;
-      ST_SET(ts_in[free_idx], TRANS_ACTIVE);
       free_idx = (free_idx + 1) % USB_IN_TRANSFERS; /* Increment (and wrap around). */
     }
 

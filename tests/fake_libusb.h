@@ -115,8 +115,15 @@ void libusb_free_transfer(struct libusb_transfer *t) {
   __atomic_fetch_add(&g_fake_freed, 1, __ATOMIC_SEQ_CST);
   if (g_fake_io_ok) free(t);
 }
+static int g_fake_complete_in_submit;  /* complete an IN transfer inside submit (another thread's events) */
+static void fake_complete(struct libusb_transfer *t);
 int libusb_submit_transfer(struct libusb_transfer *t) {
   if (!g_fake_io_ok || __atomic_load_n(&g_fake_fail, __ATOMIC_SEQ_CST)) return LIBUSB_ERROR_IO;
+  if ((t->endpoint & 0x80) && __atomic_load_n(&g_fake_complete_in_submit, __ATOMIC_SEQ_CST)) {
+    __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);
+    fake_complete(t);                  /* done before submit returns, as another event thread could */
+    return 0;
+  }
   __atomic_fetch_add(&g_fake_submits, 1, __ATOMIC_SEQ_CST);
   pthread_mutex_lock(&g_fake_qm);
   if (!(t->endpoint & 0x80) && t->dev_handle)
@@ -137,17 +144,19 @@ int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
   memcpy(done, g_fake_q, sizeof(done[0]) * (size_t) n);
   g_fake_nq = 0;
   pthread_mutex_unlock(&g_fake_qm);
-  for (int i = 0; i < n; i++) {
-    struct libusb_transfer *t = done[i];
+  for (int i = 0; i < n; i++)
+    fake_complete(done[i]);
+  return 0;
+}
+void libusb_exit(libusb_context *c) { (void) c; }
+
+static void fake_complete(struct libusb_transfer *t) {
     t->status = __atomic_load_n(&g_fake_fail_status, __ATOMIC_SEQ_CST) ? LIBUSB_TRANSFER_NO_DEVICE
                                                                        : LIBUSB_TRANSFER_COMPLETED;
     t->actual_length = t->length;
     if (t->endpoint & 0x80)
       for (int k = 0; k < t->length && k < 3; k++) t->buffer[k] = __atomic_load_n(&g_fake_in[k], __ATOMIC_SEQ_CST);
     t->callback(t);
-  }
-  return 0;
 }
-void libusb_exit(libusb_context *c) { (void) c; }
 
 #endif
