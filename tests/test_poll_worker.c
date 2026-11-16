@@ -921,6 +921,30 @@ static void s31(void) {
   free(inst);
 }
 
+/* S31b, through the public path: a request that keeps progressing is not cut by the progress deadline. A
+ * 3000-byte transceive needs four rounds of 32 IN transfers; each event round takes 100 ms (the fake's hook), so
+ * the call lasts longer than PINEDIO_XFER_MS but never goes that long without a completion: it returns 0. With
+ * the deadline not restarted by completions it failed after PINEDIO_XFER_MS. */
+static void slow_events(void) {
+  if (pthread_equal(pthread_self(), g_main_thread)) { struct timespec d = {0, 100000000L}; nanosleep(&d, NULL); }
+}
+static void s31b(void) {
+  g_main_thread = pthread_self();
+  struct pinedio_inst *inst = open_inst();
+  static uint8_t w[3000], r[3000];
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  __atomic_store_n(&g_fake_on_events, slow_events, __ATOMIC_SEQ_CST);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int rc = pinedio_transceive(inst, w, r, sizeof(r));
+  long ms = ms_since(&t0);
+  __atomic_store_n(&g_fake_on_events, NULL, __ATOMIC_SEQ_CST);
+  printf("     S31b: rc %d after %ld ms\n", rc, ms);
+  fflush(stdout);
+  assert(rc == 0 && ms > PINEDIO_XFER_MS);
+  close_inst(inst);
+}
+
 /* S32a, through the public path: a caller holds the USB mutex inside its event handling and does not come back
  * (a callback blocked in the caller's code: the fake's hold point). deinit returns -1 within its one deadline
  * (PINEDIO_DRAIN_MS) releasing nothing; once the caller has returned, deinit returns 0. Red before: deinit
@@ -1249,6 +1273,7 @@ int main(int argc, char **argv) {
     {"S29d a refused CS release goes out before the next assertion", s29d},
     {"S30 a transfer whose callback never comes: bounded, abandoned, retryable", s30},
     {"S31 an IN callback that never comes: the call ends by its progress deadline", s31},
+    {"S31b a request that keeps progressing outlives the progress deadline", s31b},
     {"S32a a caller blocked with the mutex: deinit -1 within its deadline", s32a},
     {"S32b a callback that does not return: deinit -1 within its deadline", s32b},
     {"S33 a callback only stores: it never blocks on stderr", s33},
