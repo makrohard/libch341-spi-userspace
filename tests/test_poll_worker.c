@@ -492,11 +492,11 @@ static void s8b(void) {
   dup2(saved, 2);
   rewind(log);
   char line[256];
-  int lines = 0;
-  while (fgets(line, sizeof(line), log)) lines++;
+  int lines = 0, first = 0;
+  while (fgets(line, sizeof(line), log)) { lines++; if (!strncmp(line, "Failed to get input", 19)) first++; }
   printf("     S8b: %d stderr lines over 8 failing polls\n", lines);
   fflush(stdout);
-  assert(lines <= 4);
+  assert(lines <= 4 && first == 1);   /* bounded, and the first failure is reported (after the worker's unlock) */
   __atomic_store_n(&g_fake_fail_status, 0, __ATOMIC_SEQ_CST);
   close_inst(inst);
 }
@@ -919,11 +919,19 @@ static void s31(void) {
   __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
   struct timespec t0;
   clock_gettime(CLOCK_MONOTONIC, &t0);
+  __atomic_store_n(&g_fake_ev_end_max, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_tv_max, 0, __ATOMIC_SEQ_CST);
   assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1);
+  long long returned = fake_now_ms();
+  long long longest = __atomic_load_n(&g_fake_tv_max, __ATOMIC_SEQ_CST);
   long ms = ms_since(&t0);
-  printf("     S31: the call returned after %ld ms\n", ms);
+  long long over = __atomic_load_n(&g_fake_ev_end_max, __ATOMIC_SEQ_CST) - returned;
+  printf("     S31: the call returned after %ld ms; latest event-wait end %lld ms after its return; longest wait %lld ms\n",
+         ms, over, longest);
   fflush(stdout);
   assert(ms >= PINEDIO_XFER_MS && ms < PINEDIO_XFER_MS + PINEDIO_DRAIN_MS + 1000);
+  assert(over <= 5);   /* no event wait (the loop's, the drain's) went past the deadline it had */
+  assert(longest <= PINEDIO_XFER_MS);   /* the loop's waits are capped by its progress deadline, not 1 s */
   assert(inst->req_abandoned && __atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) == 0);
   int freed = g_fake_freed;
   assert(pinedio_deinit(inst) == -1);                                 /* outstanding: nothing released */
@@ -1058,6 +1066,140 @@ static void s33(void) {
   printf("     S33: callbacks with a blocking stderr: %s\n", ok ? "all returned" : "one blocked");
   fflush(stdout);
   assert(ok);
+}
+
+/* S34, through the public path, with stderr a full blocking pipe (every write would block): no diagnostic is
+ * written while the USB mutex is held and none delays deinit. (a) A failing call (its IN submit fails) returns at
+ * once and deinit returns 0 within its deadline. (b) A caller holds the mutex in its event handling: deinit
+ * returns -1 within its deadline (its refusal line never delays the return). (c) The worker's failing polls do not
+ * hold the mutex: a public call and deinit return. Before, the report was written under the mutex and deinit's
+ * refusal line before its return: each case blocked (the child's alarm). */
+static int stderr_full(int *saved) {
+  int p[2];
+  assert(pipe(p) == 0);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  assert(fcntl(p[1], F_SETFL, O_NONBLOCK) == 0);
+  while (write(p[1], junk, sizeof(junk)) > 0) { }
+  while (write(p[1], junk, 1) == 1) { }
+  assert(fcntl(p[1], F_SETFL, 0) == 0);
+  fflush(stderr);
+  *saved = dup(2);
+  dup2(p[1], 2);
+  return p[0];
+}
+static void stderr_back(int saved) { dup2(saved, 2); }
+static void s34a(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  int saved;
+  stderr_full(&saved);
+  __atomic_store_n(&g_fake_fail_in, 1, __ATOMIC_SEQ_CST);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int rc = pinedio_transceive(inst, w, r, sizeof(r));
+  long call_ms = ms_since(&t0);
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int drc = pinedio_deinit(inst);
+  long d_ms = ms_since(&t0);
+  stderr_back(saved);
+  printf("     S34a: call rc %d after %ld ms, deinit rc %d after %ld ms\n", rc, call_ms, drc, d_ms);
+  fflush(stdout);
+  assert(rc == -1 && call_ms < PINEDIO_XFER_MS && drc == 0 && d_ms < PINEDIO_DRAIN_MS);
+  free(inst);
+}
+static void s34b(void) {
+  g_main_thread = pthread_self();
+  struct pinedio_inst *inst = open_inst();
+  arm(&H_blocked);
+  __atomic_store_n(&g_fake_on_events, blocked_on_events, __ATOMIC_SEQ_CST);
+  pthread_t t;
+  assert(pthread_create(&t, NULL, blocked_read, inst) == 0);
+  wait_arrived(&H_blocked);                       /* the caller holds the mutex, in its event handling */
+  int saved;
+  stderr_full(&saved);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int drc = pinedio_deinit(inst);
+  long ms = ms_since(&t0);
+  stderr_back(saved);
+  printf("     S34b: deinit rc %d after %ld ms\n", drc, ms);
+  fflush(stdout);
+  assert(drc == -1 && ms < PINEDIO_DRAIN_MS + 500);
+  __atomic_store_n(&g_fake_on_events, NULL, __ATOMIC_SEQ_CST);
+  release(&H_blocked);
+  pthread_join(t, NULL);
+  assert(pinedio_deinit(inst) == 0);
+  free(inst);
+}
+static void s34c(void) {
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_a);
+  int saved;
+  stderr_full(&saved);
+  __atomic_store_n(&g_fake_fail_status, 1, __ATOMIC_SEQ_CST);
+  int p = polls();
+  wait_polls(p + 3);                              /* failing polls, each with its diagnostic */
+  assert(__atomic_load_n(&inst->in_error, __ATOMIC_SEQ_CST));
+  assert(pinedio_set_pin_mode(inst, 1, 1) == 0);  /* the mutex is not held by a write */
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int drc = pinedio_deinit(inst);
+  long ms = ms_since(&t0);
+  stderr_back(saved);
+  printf("     S34c: deinit rc %d after %ld ms\n", drc, ms);
+  fflush(stdout);
+  assert(drc == 0 && ms < PINEDIO_DRAIN_MS);
+  __atomic_store_n(&g_fake_fail_status, 0, __ATOMIC_SEQ_CST);
+  free(inst);
+}
+
+/* S35, through the public path: deinit's last drain gets what is left of its one deadline, not a fresh one. A
+ * request is abandoned (S30's sequence); a counted caller keeps deinit waiting for about 400 ms; then the drain of
+ * the still outstanding transfer ends with the deadline: deinit returns -1 within PINEDIO_DRAIN_MS (+ slack), and
+ * no event wait it made went past that deadline. */
+static volatile long g_s35_ms;
+static volatile int g_s35_rc;
+static struct timespec g_s35_t0;
+static void *s35_deinit(void *arg) {
+  pthread_mutex_lock(&g_m); g_deinit_thread = pthread_self(); g_deinit_thread_set = 1; pthread_mutex_unlock(&g_m);
+  clock_gettime(CLOCK_MONOTONIC, &g_s35_t0);
+  g_s35_rc = pinedio_deinit(arg);
+  g_s35_ms = ms_since(&g_s35_t0);
+  return NULL;
+}
+static void s35(void) {
+  struct pinedio_inst *inst = open_inst();
+  uint8_t w[3] = {0}, r[3] = {0};
+  assert(pinedio_set_option(inst, PINEDIO_OPTION_AUTO_CS, 0) == 0);
+  __atomic_store_n(&g_fake_hold_out, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_fail_in, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 1, __ATOMIC_SEQ_CST);
+  assert(pinedio_transceive(inst, w, r, sizeof(r)) == -1 && inst->req_abandoned);
+  __atomic_store_n(&g_fake_fail_in, 0, __ATOMIC_SEQ_CST);
+  pthread_t d, h;
+  arm(&H_api_entered);                            /* D is counted and held before its lock */
+  assert(pthread_create(&d, NULL, d_thread, inst) == 0);
+  wait_arrived(&H_api_entered);
+  __atomic_store_n(&g_fake_ev_end_max, 0, __ATOMIC_SEQ_CST);
+  assert(pthread_create(&h, NULL, s35_deinit, inst) == 0);
+  wait_event(EV_DEINIT_COND_WAIT);                /* deinit waits for D */
+  struct timespec spend = {0, 400000000L};
+  nanosleep(&spend, NULL);                        /* the time D keeps deinit waiting (the case's subject) */
+  release(&H_api_entered);
+  pthread_join(d, NULL);
+  pthread_join(h, NULL);
+  long long t0_ms = (long long) g_s35_t0.tv_sec * 1000 + g_s35_t0.tv_nsec / 1000000;
+  long long over = __atomic_load_n(&g_fake_ev_end_max, __ATOMIC_SEQ_CST) - (t0_ms + PINEDIO_DRAIN_MS);
+  printf("     S35: deinit rc %d after %ld ms; latest event-wait end %lld ms past its deadline\n", g_s35_rc,
+         g_s35_ms, over);
+  fflush(stdout);
+  assert(g_s35_rc == -1 && g_s35_ms < PINEDIO_DRAIN_MS + 200 && over <= 5);
+  __atomic_store_n(&g_fake_hold_out, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_fake_cancel_not_found, 0, __ATOMIC_SEQ_CST);
+  assert(pinedio_deinit(inst) == 0);
+  free(inst);
 }
 
 /* S12: a NULL callback is refused and never touches the count, on a disabled and on an enabled pin. */
@@ -1290,6 +1432,10 @@ int main(int argc, char **argv) {
     {"S32a a caller blocked with the mutex: deinit -1 within its deadline", s32a},
     {"S32b a callback that does not return: deinit -1 within its deadline", s32b},
     {"S33 a callback only stores: it never blocks on stderr", s33},
+    {"S34a stderr blocked: a failing call and deinit return", s34a},
+    {"S34b stderr blocked: deinit -1 within its deadline", s34b},
+    {"S34c stderr blocked: the worker's failing polls hold no mutex", s34c},
+    {"S35 deinit's last drain gets what is left of its deadline", s35},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},

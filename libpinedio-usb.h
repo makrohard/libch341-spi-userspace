@@ -82,6 +82,8 @@ struct pinedio_inst {
   uint32_t req_cap_out, req_cap_in;
   bool req_abandoned;
   bool cs_release_pending;           /* an AUTO_CS release failed: it goes out before the next assertion */
+  char diag[256];                    /* diagnostics collected under the mutex, written after its unlock */
+  size_t diag_len;
   pthread_cond_t poll_cond;          /* the worker's waits (CLOCK_MONOTONIC) and deinit's caller wait */
   bool worker_started;
   bool worker_done;                  /* the worker has left its loop (under the mutex; deinit waits for it) */
@@ -127,6 +129,8 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * a call or the worker (a callback) that has not returned, or a USB transfer whose callback has not come):
  * nothing was released, deinit may be called again. deinit never blocks longer than that deadline (on glibc;
  * elsewhere its first lock of the mutex is unbounded). A USB request whose transfers make no progress for
+ * Its diagnostics are best-effort and never delay its return (nor any other call's): the library writes nothing
+ * while its mutex is held and drops a line stderr cannot take at once. A USB request whose transfers make no progress for
  * PINEDIO_XFER_MS fails (-1) and is cancelled; if a cancelled transfer's callback then does not come within
  * PINEDIO_DRAIN_MS, the request is abandoned. While an abandoned request's transfer is outstanding, a call that
  * needs a USB transfer (digital_write, set_cs, digital_read, get_irq_state, a non-empty write_read or transceive,

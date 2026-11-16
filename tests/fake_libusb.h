@@ -160,9 +160,24 @@ int libusb_cancel_transfer(struct libusb_transfer *t) {
   __atomic_fetch_add(&g_fake_cancels, 1, __ATOMIC_SEQ_CST);
   return __atomic_load_n(&g_fake_cancel_not_found, __ATOMIC_SEQ_CST) ? LIBUSB_ERROR_NOT_FOUND : 0;
 }
+static long long g_fake_ev_end_max;     /* the latest monotonic end (ms) an event wait was given (now + tv) */
+static long long g_fake_tv_max;         /* the longest event wait (ms) given */
+static long long fake_now_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (long long) t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 static int fake_queued(void) { pthread_mutex_lock(&g_fake_qm); int n = g_fake_nq; pthread_mutex_unlock(&g_fake_qm); return n; }
 int libusb_handle_events_timeout(libusb_context *c, struct timeval *tv) {
-  (void) c; (void) tv;
+  (void) c;
+  if (tv) {   /* the fake does not wait; it records how long the caller let it */
+    long long wait = (long long) tv->tv_sec * 1000 + tv->tv_usec / 1000, end = fake_now_ms() + wait;
+    long long w = __atomic_load_n(&g_fake_tv_max, __ATOMIC_SEQ_CST);
+    while (wait > w && !__atomic_compare_exchange_n(&g_fake_tv_max, &w, wait, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { }
+    long long cur = __atomic_load_n(&g_fake_ev_end_max, __ATOMIC_SEQ_CST);
+    while (end > cur && !__atomic_compare_exchange_n(&g_fake_ev_end_max, &cur, end, 0, __ATOMIC_SEQ_CST,
+                                                     __ATOMIC_SEQ_CST)) { }
+  }
   void (*on_events)(void) = __atomic_load_n(&g_fake_on_events, __ATOMIC_SEQ_CST);
   if (on_events) on_events();
   __atomic_fetch_add(&g_fake_events, 1, __ATOMIC_SEQ_CST);

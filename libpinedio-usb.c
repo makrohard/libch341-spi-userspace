@@ -14,6 +14,8 @@
 #define _GNU_SOURCE   /* pthread_mutex_clocklock (glibc) */
 #endif
 #include <errno.h>
+#include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +53,37 @@
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
+/* Diagnostics. Nothing writes while the USB mutex is held: a stalled stderr (a full pipe nobody reads) would hold
+ * the mutex, every other caller and deinit's deadline. Lines are collected in the instance under the mutex
+ * (truncated when the buffer is full) and written after the unlock, best-effort: only if stderr takes them at
+ * once, else dropped, so no thread of the library ever blocks on stderr. Never through stdio: a thread blocked
+ * in fprintf holds stderr's stream lock. */
+static void diag_print(const char *s) {
+  size_t n = strlen(s);
+  struct pollfd p = { .fd = STDERR_FILENO, .events = POLLOUT };
+  if (n > 0 && poll(&p, 1, 0) == 1 && (p.revents & POLLOUT))
+    (void) !write(STDERR_FILENO, s, n);
+}
+static void diag(struct pinedio_inst *inst, const char *fmt, ...) {
+  size_t used = inst->diag_len, cap = sizeof(inst->diag);
+  if (used >= cap - 1)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(inst->diag + used, cap - used, fmt, ap);
+  va_end(ap);
+  if (n < 0)
+    inst->diag[used] = '\0';
+  else
+    inst->diag_len = (size_t) n < cap - used ? used + (size_t) n : cap - 1;
+}
+/* Under the mutex: move the collected lines into out (sizeof(inst->diag) bytes) and clear them. */
+static void diag_take(struct pinedio_inst *inst, char *out) {
+  memcpy(out, inst->diag, inst->diag_len);
+  out[inst->diag_len] = '\0';
+  inst->diag_len = 0;
+}
+
 /* Every call that takes the mutex is counted from before its lock to its last unlock, so deinit can wait until
  * no caller is left before it destroys the mutex and the condvar. A call that finds the instance closing leaves
  * at once (-1). Returns 0 with the mutex held. */
@@ -68,13 +101,16 @@ static int api_enter(struct pinedio_inst *inst) {
   return 0;
 }
 
-/* The caller's last access to the instance is this unlock. */
+/* The caller's last access to the instance is this unlock; its diagnostics are written after it. */
 static void api_exit(struct pinedio_inst *inst) {
+  char msg[sizeof(inst->diag)];
+  diag_take(inst, msg);
   PINEDIO_TEST_HOOK(api_exit);
   __atomic_fetch_sub(&inst->api_active, 1, __ATOMIC_SEQ_CST);
   if (inst->closing)
     pthread_cond_broadcast(&inst->poll_cond);
   pthread_mutex_unlock(&inst->usb_access_mutex);
+  diag_print(msg);
 }
 
 /* A public device call: counted from its first statement, the whole operation under the mutex, refused (-1)
@@ -185,9 +221,9 @@ static void report_failed(const char *func, struct pinedio_inst *inst) {
     if (ST_GET(*ts) != TRANS_ERR || ts->status < 0 || ts->status == LIBUSB_TRANSFER_CANCELLED)
       continue;
     if (ts->status != LIBUSB_TRANSFER_COMPLETED)
-      fprintf(stderr, "%s: %s transfer: error: %s\n", func, i < 0 ? "OUT" : "IN", libusb_error_name(ts->status));
+      diag(inst, "%s: %s transfer: error: %s\n", func, i < 0 ? "OUT" : "IN", libusb_error_name(ts->status));
     else
-      fprintf(stderr, "%s: %s transfer: short: %d of %d bytes\n", func, i < 0 ? "OUT" : "IN", ts->actual, t->length);
+      diag(inst, "%s: %s transfer: short: %d of %d bytes\n", func, i < 0 ? "OUT" : "IN", ts->actual, t->length);
     return;
   }
 }
@@ -366,16 +402,16 @@ err:
     inst->req_abandoned = true;
   if (func) {
     if (submit_err)
-      fprintf(stderr, "%s: failed to submit %s transfer: %s\n", func, submit_dir, libusb_error_name(submit_err));
+      diag(inst, "%s: failed to submit %s transfer: %s\n", func, submit_dir, libusb_error_name(submit_err));
     else if (stalled)
-      fprintf(stderr, "%s: no USB transfer progress within %d ms\n", func, PINEDIO_XFER_MS);
+      diag(inst, "%s: no USB transfer progress within %d ms\n", func, PINEDIO_XFER_MS);
     else
       report_failed(func, inst);
-    fprintf(stderr, "%s: Failed to %s %u bytes\n", func, write_failed ? "write" : "read",
-            write_failed ? writecnt : readcnt);
+    diag(inst, "%s: Failed to %s %u bytes\n", func, write_failed ? "write" : "read",
+         write_failed ? writecnt : readcnt);
   }
   if (!drained)
-    fprintf(stderr, "%s: a USB transfer did not end within %d ms: request abandoned\n",
+    diag(inst, "%s: a USB transfer did not end within %d ms: request abandoned\n",
             func ? func : "usb_transfer", PINEDIO_DRAIN_MS);
   return -1;
 }
@@ -434,6 +470,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   inst->worker_started = false;
   inst->worker_done = false;
   inst->cs_release_pending = false;
+  inst->diag_len = 0;
   inst->closed = false;
   inst->int_running_cnt = 0;
   for (int i = 0; i < PINEDIO_INT_PIN_MAX; i++) {
@@ -477,7 +514,9 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
     return -1;
   }
 
-  libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_INFO);
+  /* libusb's own log writes to stderr inside the calls made with the USB mutex held: off (LIBUSB_DEBUG in the
+   * environment still sets its level; libusb then ignores this). */
+  libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_NONE);
   if (inst->options[PINEDIO_OPTION_VID] == 0) {
     inst->options[PINEDIO_OPTION_VID] = 0x1A86;
   }
@@ -644,7 +683,7 @@ static int32_t digital_write_locked(struct pinedio_inst *inst, uint32_t pin, boo
 
   int32_t ret = usb_transfer(inst, "pinedio_digital_write", sizeof(buf), 0, buf, NULL);
   if (ret < 0) {
-    printf("Failed to set CS pin.\n");
+    diag(inst, "Failed to set CS pin.\n");
   }
   return ret;
 
@@ -798,7 +837,7 @@ static int32_t digital_read_locked(struct pinedio_inst *inst, uint32_t pin) {
 
   int32_t ret = usb_transfer(inst, "pinedio_digital_read", sizeof(buf), sizeof(output), buf, output);
   if (ret < 0) {
-    fprintf(stderr, "Could not get input pins.\n");
+    diag(inst, "Could not get input pins.\n");
     return ret;
   }
   // *input = ((output[2] & 0x80) << 16) | ((output[1] & 0xef) << 8) | output[0];
@@ -826,7 +865,7 @@ static int32_t pinedio_get_input(struct pinedio_inst *inst, uint32_t* input)
 {
   int32_t ret = read_input_locked(inst, "pinedio_get_input", input);
   if (ret < 0) {
-    fprintf(stderr, "Could not get input pins.\n");
+    diag(inst, "Could not get input pins.\n");
   }
   return ret;
 }
@@ -870,7 +909,7 @@ static void *pinedio_poll_worker(void *arg) {
     int32_t ret = pinedio_poll_read(inst, &input);
     if (ret < 0) {
       if (!__atomic_load_n(&inst->in_error, __ATOMIC_SEQ_CST))
-        fprintf(stderr, "Failed to get input, res: %d\n", ret);
+        diag(inst, "Failed to get input, res: %d\n", ret);
       __atomic_store_n(&inst->in_error, true, __ATOMIC_SEQ_CST);   /* read by callers without the mutex */
     } else {
       for (uint8_t int_pin = 0; int_pin < PINEDIO_INT_PIN_MAX; int_pin++) {
@@ -886,9 +925,13 @@ static void *pinedio_poll_worker(void *arg) {
         inst_int->previous_state = state;
       }
     }
-    if (n > 0) {
+    char msg[sizeof(inst->diag)];
+    diag_take(inst, msg);   /* the poll's diagnostics: written without the mutex, with the callbacks */
+    if (n > 0 || msg[0]) {
       pthread_mutex_unlock(&inst->usb_access_mutex);
-      PINEDIO_TEST_HOOK(before_callbacks);
+      diag_print(msg);
+      if (n > 0)
+        PINEDIO_TEST_HOOK(before_callbacks);
       for (int i = 0; i < n; i++)
         calls[i]();
       pthread_mutex_lock(&inst->usb_access_mutex);
@@ -963,17 +1006,21 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
   if (inst->closed)
     return 0;   /* closed already: its mutex and condvar are destroyed, nothing to do */
   if (inst->worker_started && pthread_equal(pthread_self(), inst->pin_poll_thread)) {
-    fprintf(stderr, "pinedio_deinit: called from a poll callback, refused\n");
+    diag_print("pinedio_deinit: called from a poll callback, refused\n");
     return -1;
   }
   PINEDIO_TEST_HOOK(deinit_entered);
   /* Every wait below ends by one deadline, PINEDIO_DRAIN_MS from here: a caller or a callback that does not
    * return (a USB event that never comes, a callback blocked in the caller's code) makes deinit return -1,
-   * nothing released, retryable; it never blocks deinit for ever. */
+   * nothing released, retryable; it never blocks deinit for ever. The result is decided first; its line is
+   * best-effort (diag_print) and never delays the return. */
   struct timespec end;
   deadline_after(&end, PINEDIO_DRAIN_MS);
   if (lock_until(&inst->usb_access_mutex, &end) != 0) {
-    fprintf(stderr, "pinedio_deinit: the instance stayed busy for %d ms, nothing released\n", PINEDIO_DRAIN_MS);
+    char line[128];
+    snprintf(line, sizeof(line), "pinedio_deinit: the instance stayed busy for %d ms, nothing released\n",
+             PINEDIO_DRAIN_MS);
+    diag_print(line);
     return -1;
   }
   inst->closing = true;
@@ -989,15 +1036,19 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
   bool busy = (inst->worker_started && !inst->worker_done) || __atomic_load_n(&inst->api_active, __ATOMIC_SEQ_CST) > 0;
   pthread_mutex_unlock(&inst->usb_access_mutex);
   if (busy) {
-    fprintf(stderr, "pinedio_deinit: a call or the poll worker did not return within %d ms, nothing released\n",
-            PINEDIO_DRAIN_MS);
+    char line[128];
+    snprintf(line, sizeof(line), "pinedio_deinit: a call or the poll worker did not return within %d ms, "
+             "nothing released\n", PINEDIO_DRAIN_MS);
+    diag_print(line);
     return -1;
   }
 
   if (inst->worker_started) {
     int jr = pthread_join(inst->pin_poll_thread, NULL);   /* it has left its loop: only its return is left */
     if (jr != 0) {   /* not proven terminated: release nothing */
-      fprintf(stderr, "pinedio_deinit: the poll worker could not be joined (%d), nothing released\n", jr);
+      char line[128];
+      snprintf(line, sizeof(line), "pinedio_deinit: the poll worker could not be joined (%d), nothing released\n", jr);
+      diag_print(line);
       return -1;
     }
     inst->worker_started = false;   /* the worker has terminated */
@@ -1007,7 +1058,7 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
   /* An abandoned request may still be called back: drain it within what is left of the deadline, and free
    * nothing (-1, retryable) if its callback still has not come. */
   if (inst->req_abandoned && !req_drain(inst, &end)) {
-    fprintf(stderr, "pinedio_deinit: a USB transfer is still outstanding, nothing released\n");
+    diag_print("pinedio_deinit: a USB transfer is still outstanding, nothing released\n");
     return -1;
   }
   inst->req_abandoned = false;
