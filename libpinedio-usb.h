@@ -117,11 +117,12 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
  * transfers are freed, the handle is closed and the mutex and condvar are destroyed. It does not cover a call
  * that starts after deinit began: the owner must not start one (a call that has not reached its first statement
  * is outside any library's reach). After 0 the instance may be freed; a second deinit returns 0 and touches
- * nothing. -1 (from a callback, or a worker that could not be joined): nothing was released, deinit may be
- * called again. */
+ * nothing. -1 (from a callback, a worker that could not be joined, or a USB transfer whose callback has not come
+ * within the drain deadline): nothing was released, deinit may be called again. While such a transfer is
+ * outstanding every call is refused (-1). */
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
-/* 0: closed, the instance may be freed (see above). -1: refused (from a callback, or no join): nothing released. */
+/* 0: closed, the instance may be freed (see above). -1: refused (see above): nothing released, retryable. */
 int32_t pinedio_deinit(struct pinedio_inst* inst);
 /* OR bits into the pin mode and state every later open starts with (e.g. to keep RESET high on an open);
  * an open device keeps its own copy. pinedio_d_mode / pinedio_d_state are that template. */
