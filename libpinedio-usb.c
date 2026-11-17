@@ -14,11 +14,14 @@
 #define _GNU_SOURCE   /* pthread_mutex_clocklock (glibc) */
 #endif
 #include <errno.h>
-#include <poll.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include "libpinedio-usb.h"
@@ -55,14 +58,72 @@
 
 /* Diagnostics. Nothing writes while the USB mutex is held: a stalled stderr (a full pipe nobody reads) would hold
  * the mutex, every other caller and deinit's deadline. Lines are collected in the instance under the mutex
- * (truncated when the buffer is full) and written after the unlock, best-effort: only if stderr takes them at
- * once, else dropped, so no thread of the library ever blocks on stderr. Never through stdio: a thread blocked
- * in fprintf holds stderr's stream lock. */
+ * (truncated when the buffer is full) and written after the unlock, best-effort, by a write that cannot wait and
+ * cannot raise SIGPIPE in the caller:
+ * - a regular file: write() (it waits for no reader);
+ * - a socket: send() with MSG_DONTWAIT | MSG_NOSIGNAL;
+ * - a pipe, FIFO or terminal: write() on a private O_NONBLOCK open of the same pipe or terminal
+ *   (/proc/self/fd/2), so a full one returns EAGAIN at once. Polling stderr itself is not enough (another writer
+ *   can fill it between the poll and the write), and O_NONBLOCK on stderr itself would change it for the whole
+ *   process. SIGPIPE is blocked around that write and a SIGPIPE it raised is consumed.
+ * A line that is not written is dropped and counted; the next line written is preceded by the count. Never
+ * through stdio: a thread blocked in fprintf holds stderr's stream lock. */
+static unsigned long diag_dropped;   /* lines dropped since the last line written (atomic) */
+static bool write_nosigpipe(int fd, const char *s, size_t n) {
+  sigset_t pipe_set, old, pending;
+  sigemptyset(&pipe_set);
+  sigaddset(&pipe_set, SIGPIPE);
+  pthread_sigmask(SIG_BLOCK, &pipe_set, &old);
+  bool was_pending = sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE);
+  ssize_t r = write(fd, s, n);
+  if (r < 0 && errno == EPIPE && !was_pending) {
+    struct timespec zero = { 0, 0 };
+    sigtimedwait(&pipe_set, NULL, &zero);   /* the SIGPIPE this write raised, not a pending one of the caller's */
+  }
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+  return r == (ssize_t) n;
+}
+static bool diag_write(const char *s, size_t n) {
+  struct stat st;
+  if (fstat(STDERR_FILENO, &st) != 0)
+    return false;
+  if (S_ISREG(st.st_mode))
+    return write(STDERR_FILENO, s, n) == (ssize_t) n;
+  if (S_ISSOCK(st.st_mode))
+    return send(STDERR_FILENO, s, n, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t) n;
+  int fd = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+  if (fd < 0)
+    return false;   /* also a pipe without a reader (ENXIO) */
+  PINEDIO_TEST_HOOK(diag_opened);   /* a reader can still go before the write */
+  bool ok = write_nosigpipe(fd, s, n);
+  close(fd);
+  return ok;
+}
 static void diag_print(const char *s) {
   size_t n = strlen(s);
-  struct pollfd p = { .fd = STDERR_FILENO, .events = POLLOUT };
-  if (n > 0 && poll(&p, 1, 0) == 1 && (p.revents & POLLOUT))
-    (void) !write(STDERR_FILENO, s, n);
+  if (n == 0)
+    return;
+  unsigned long dropped = __atomic_exchange_n(&diag_dropped, 0, __ATOMIC_SEQ_CST);
+  if (dropped > 0) {
+    char note[96];
+    int m = snprintf(note, sizeof(note), "libpinedio-usb: %lu diagnostic line(s) dropped (stderr full)\n", dropped);
+    if (m <= 0 || !diag_write(note, (size_t) m)) {
+      __atomic_fetch_add(&diag_dropped, dropped + 1, __ATOMIC_SEQ_CST);
+      return;
+    }
+  }
+  if (!diag_write(s, n))
+    __atomic_fetch_add(&diag_dropped, 1, __ATOMIC_SEQ_CST);
+}
+/* A formatted line through diag_print: every line of the library goes this way, also outside the mutex. */
+static void diag_printf(const char *fmt, ...) {
+  char line[256];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  if (n > 0)
+    diag_print(line);
 }
 static void diag(struct pinedio_inst *inst, const char *fmt, ...) {
   size_t used = inst->diag_len, cap = sizeof(inst->diag);
@@ -481,7 +542,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
 
   ret = pthread_mutex_init(&inst->usb_access_mutex, NULL);
   if (ret != 0) {
-    fprintf(stderr, "Failed to initialize mutex, res: %d.\n", ret);
+    diag_printf("Failed to initialize mutex, res: %d.\n", ret);
     return -1;
   }
   pthread_condattr_t cond_attr;
@@ -493,7 +554,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
     pthread_condattr_destroy(&cond_attr);
   }
   if (ret != 0) {
-    fprintf(stderr, "Failed to initialize condvar, res: %d.\n", ret);
+    diag_printf("Failed to initialize condvar, res: %d.\n", ret);
     pthread_mutex_destroy(&inst->usb_access_mutex);
     return -1;
   }
@@ -509,7 +570,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
 
   ret = libusb_init(NULL);
   if (ret < 0) {
-    fprintf(stderr, "Couldn't initialize libusb!\n");
+    diag_printf("Couldn't initialize libusb!\n");
     sync_destroy(inst);
     return -1;
   }
@@ -530,7 +591,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   ssize_t cnt = libusb_get_device_list(NULL, &list);
   ssize_t i = 0;
   if (cnt < 0) {
-    fprintf(stderr, "Couldn't list the USB devices: %s\n", libusb_error_name((int) cnt));
+    diag_printf("Couldn't list the USB devices: %s\n", libusb_error_name((int) cnt));
     sync_destroy(inst);
     return -2;   /* the libusb reference was taken */
   }
@@ -571,13 +632,13 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
         // On Windows, driver needs to be replaced manually by Zadig
         ret = libusb_detach_kernel_driver(inst->handle, 0);
         if (ret != 0 && ret != LIBUSB_ERROR_NOT_FOUND) {
-          fprintf(stderr, "Cannot detach the existing USB driver. Claiming the interface may fail: %s\n",
+          diag_printf("Cannot detach the existing USB driver. Claiming the interface may fail: %s\n",
                 libusb_error_name(ret));
         }
 #endif
         ret = libusb_claim_interface(inst->handle, 0);
         if (ret != 0) {
-          fprintf(stderr, "Failed to claim interface 0: %s\n", libusb_error_name(ret));
+          diag_printf("Failed to claim interface 0: %s\n", libusb_error_name(ret));
           libusb_close(inst->handle);
           inst->handle = NULL;
         } else {
@@ -592,7 +653,7 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
 
   if (inst->handle == NULL) {
     // TODO: Rework this so we can receive error and print it.
-    fprintf(stderr, "Couldn't open LoRa USB device.\n");
+    diag_printf("Couldn't open LoRa USB device.\n");
     sync_destroy(inst);
     return -2;
   }
@@ -600,14 +661,14 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
   // Allocate and pre-fill transfer structures.
   inst->transfer_out = libusb_alloc_transfer(0);
   if (!inst->transfer_out) {
-    fprintf(stderr, "Failed to alloc libusb OUT transfer.\n");
+    diag_printf("Failed to alloc libusb OUT transfer.\n");
     ret = -3;   /* the libusb reference was taken; never the stale 0 of the claim */
     goto deinit_on_error;
   }
   for (int i = 0; i < USB_IN_TRANSFERS; i++) {
     inst->transfer_ins[i] = libusb_alloc_transfer(0);
     if (inst->transfer_ins[i] == NULL) {
-      fprintf(stderr, "Failed to alloc libusb IN transfer %d.\n", (int) i);
+      diag_printf("Failed to alloc libusb IN transfer %d.\n", (int) i);
       ret = -3;
       goto deinit_on_error;
     }
@@ -625,14 +686,14 @@ int32_t pinedio_init_at_port(struct pinedio_inst *inst, void *driver, const char
    */
 
   if (pinedio_set_cs(inst, false) != 0) {
-    fprintf(stderr, "Failed to set the initial CS level.\n");
+    diag_printf("Failed to set the initial CS level.\n");
     ret = -3;   /* the libusb reference was taken */
     goto deinit_on_error;
   }
 
   ret = pthread_create(&inst->pin_poll_thread, NULL, pinedio_poll_worker, inst);
   if (ret != 0) {
-    fprintf(stderr, "Failed to create the poll thread, res: %d\n", ret);
+    diag_printf("Failed to create the poll thread, res: %d\n", ret);
     ret = -3;   /* the libusb reference was taken, as with -2 and 0 */
     goto deinit_on_error;
   }
@@ -963,7 +1024,7 @@ int32_t
 pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode,
                          void (*callback)(void)) {
   if (api_enter(inst) != 0) {   /* first: the call is counted before anything else */
-    fprintf(stderr, "pinedio_attach_interrupt: instance is closing, refused\n");
+    diag_printf("pinedio_attach_interrupt: instance is closing, refused\n");
     return -1;
   }
   if ((unsigned) int_pin >= PINEDIO_INT_PIN_MAX || callback == NULL) {
@@ -1044,11 +1105,12 @@ int32_t pinedio_deinit(struct pinedio_inst *inst) {
   }
 
   if (inst->worker_started) {
-    int jr = pthread_join(inst->pin_poll_thread, NULL);   /* it has left its loop: only its return is left */
-    if (jr != 0) {   /* not proven terminated: release nothing */
-      char line[128];
-      snprintf(line, sizeof(line), "pinedio_deinit: the poll worker could not be joined (%d), nothing released\n", jr);
-      diag_print(line);
+    /* It has left its loop, but its thread has not ended until the join returns (a thread-local destructor of a
+     * callback's code runs after its return): the join ends by the same deadline. */
+    int jr = pthread_clockjoin_np(inst->pin_poll_thread, NULL, CLOCK_MONOTONIC, &end);
+    if (jr != 0) {   /* not proven terminated: release nothing; a later deinit joins again */
+      diag_printf("pinedio_deinit: the poll worker could not be joined (%s), nothing released\n",
+                  jr == ETIMEDOUT ? "it did not end within the deadline" : strerror(jr));
       return -1;
     }
     inst->worker_started = false;   /* the worker has terminated */

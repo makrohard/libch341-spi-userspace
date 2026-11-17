@@ -10,13 +10,16 @@ Userspace driver for [PINE64 LoRa USB Adapter](https://pine64.com/product/pinedi
 - `pinedio_deinit` returns `int32_t`. 0: the thread has terminated, every counted call has made its last access,
   the transfers, handle, mutex and condvar are gone (a second call returns 0). -1: nothing released, call again
   (also while a USB transfer whose callback did not come within the drain deadline is outstanding, or a call or
-  a poll callback has not returned within that deadline: deinit never waits longer than it).
+  a poll callback has not returned, or the poll thread has not ended, within that deadline: deinit never waits
+  longer than it).
 - A USB request without progress for `PINEDIO_XFER_MS` (3 s) fails with -1 instead of waiting for ever.
 - The libusb callbacks only store a transfer's result; the failing call reports it after its wait
   (`<function>: IN|OUT transfer: ...` instead of `cb_in:` / `cb_out:` lines). Nothing is written while the USB
-  mutex is held: lines are collected and written after the unlock, best-effort (dropped when stderr would block,
-  so a stalled stderr never holds a call, the poll thread or `pinedio_deinit`). libusb's own log is off (set
-  `LIBUSB_DEBUG` to see it). "Failed to set CS pin." now goes to stderr, not stdout.
+  mutex is held: lines are collected and written after the unlock, by a write that cannot wait and cannot raise
+  SIGPIPE (a pipe or terminal through a private non-blocking open of it, a socket with `MSG_DONTWAIT |
+  MSG_NOSIGNAL`); a line stderr cannot take at once is dropped and counted, and the count precedes the next line.
+  So a stalled or closed stderr never holds a call, the poll thread or `pinedio_deinit`. libusb's own log is off
+  (set `LIBUSB_DEBUG` to see it). "Failed to set CS pin." now goes to stderr, not stdout.
 - One `pinedio_write_read` / `pinedio_transceive` moves at most `PINEDIO_SPI_MAX` (65536) bytes; a longer one
   returns -1 without a transfer. An empty one returns 0.
 - A USB read error no longer ends the thread: `in_error` stays set until `pinedio_deinit`.

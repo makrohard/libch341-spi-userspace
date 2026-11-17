@@ -9,8 +9,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <poll.h>
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
@@ -79,8 +82,11 @@ static int is_d_thread(void) {
   return r;
 }
 
+static int g_close_at_diag = -1;   /* S37g: the pipe's read end, closed between diag_write's open and its write */
 static void test_hook(const char *name) {
-  if (!strcmp(name, "in_read")) {
+  if (!strcmp(name, "diag_opened")) {
+    if (g_close_at_diag >= 0) { close(g_close_at_diag); g_close_at_diag = -1; }
+  } else if (!strcmp(name, "in_read")) {
     pthread_mutex_lock(&g_m); g_polls++; pthread_cond_broadcast(&g_c); pthread_mutex_unlock(&g_m);
     hold_point(&H_in_read);
   } else if (!strcmp(name, "before_callbacks")) hold_point(&H_before_cb);
@@ -102,11 +108,11 @@ static int w_create(pthread_t *t, const pthread_attr_t *a, void *(*f)(void *), v
   __atomic_fetch_add(&g_created, 1, __ATOMIC_SEQ_CST);
   return pthread_create(t, a, f, arg);
 }
-static int w_join(pthread_t t, void **r) {
+static int w_join(pthread_t t, void **r, clockid_t c, const struct timespec *end) {
   event(EV_JOIN_ENTER);
   if (g_fail_join) return EINVAL;
-  int rc = pthread_join(t, r);
-  __atomic_fetch_add(&g_joined, 1, __ATOMIC_SEQ_CST);
+  int rc = pthread_clockjoin_np(t, r, c, end);
+  if (rc == 0) __atomic_fetch_add(&g_joined, 1, __ATOMIC_SEQ_CST);
   event(EV_JOIN_RETURN);
   return rc;
 }
@@ -147,7 +153,7 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
                                   * the cases that hold a thread while deinit waits */
 #define PINEDIO_XFER_MS 200    /* a request's progress deadline, short for S31 */
 #define pthread_create w_create
-#define pthread_join w_join
+#define pthread_clockjoin_np w_join
 #define pthread_cond_wait w_cond_wait
 #define pthread_cond_timedwait w_cond_timedwait
 #define pthread_cond_init w_cond_init
@@ -157,7 +163,7 @@ static int w_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct 
 #define pthread_mutex_lock w_mutex_lock
 #include "../libpinedio-usb.c"
 #undef pthread_create
-#undef pthread_join
+#undef pthread_clockjoin_np
 #undef pthread_cond_wait
 #undef pthread_cond_timedwait
 #undef pthread_cond_init
@@ -1437,6 +1443,157 @@ static void s17(void) {
   free(a); free(b);
 }
 
+/* S37, through the public path (S10's sequence: deinit from a poll callback, its refusal line): a diagnostic never
+ * blocks and never raises SIGPIPE, whatever stderr is, and is written where it can be. (a) A pipe with room gets
+ * the line. (b) A pipe with no reader, SIGPIPE at its default: the process lives (before: SIGPIPE ended it).
+ * (c) A socket gets the line. (d) A full socket: nothing blocks. (e) A full pipe drops the line (S36c); after the
+ * pipe is drained, the next line is preceded by the count of dropped lines. (f) A terminal gets the line.
+ * (g) The reader goes between the private open and the write (the write fails EPIPE): no SIGPIPE ends the process,
+ * and none is left pending. (h) A socket whose peer is gone: no SIGPIPE. (i) A regular file gets two lines, the
+ * second after the first (written to stderr itself, never through a new open at offset 0).
+ * A full pipe that a competing writer fills after any check cannot block either: the write is on a private
+ * O_NONBLOCK open (S34/S36 run it with stderr full). */
+static void deinit_from_cb_stderr(int fd) {
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_deinit);
+  fflush(stderr);
+  int saved = dup(2);
+  dup2(fd, 2);
+  set_input(0x01);
+  int p = polls();
+  wait_polls(p + 2);                              /* the callback ran and its deinit returned */
+  dup2(saved, 2);
+  close(saved);
+  assert(g_deinit_rc == -1 && g_wrapper_freed == 0);
+  close_inst(inst);
+}
+static void s37a(void) {
+  int p[2];
+  assert(pipe(p) == 0);
+  deinit_from_cb_stderr(p[1]);
+  int n = -1;
+  assert(ioctl(p[0], FIONREAD, &n) == 0);
+  char buf[512] = {0};
+  assert(n > 0 && read(p[0], buf, sizeof(buf) - 1) == n);
+  printf("     S37a: %d bytes in the pipe\n", n);
+  fflush(stdout);
+  assert(strstr(buf, "pinedio_deinit: called from a poll callback, refused\n") && !strstr(buf, "dropped"));
+}
+static void s37b(void) {
+  signal(SIGPIPE, SIG_DFL);
+  int p[2];
+  assert(pipe(p) == 0);
+  close(p[0]);
+  deinit_from_cb_stderr(p[1]);
+}
+static void s37c(void) {
+  int s[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
+  deinit_from_cb_stderr(s[1]);
+  char buf[512] = {0};
+  ssize_t n = recv(s[0], buf, sizeof(buf) - 1, MSG_DONTWAIT);
+  assert(n > 0 && strstr(buf, "pinedio_deinit: called from a poll callback, refused"));
+}
+static void s37d(void) {
+  int s[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  while (send(s[1], junk, sizeof(junk), MSG_DONTWAIT) > 0) { }
+  while (send(s[1], junk, 1, MSG_DONTWAIT) == 1) { }
+  deinit_from_cb_stderr(s[1]);                    /* returns: the line is dropped */
+}
+static void s37e(void) {
+  int p[2];
+  assert(pipe(p) == 0);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  assert(fcntl(p[1], F_SETFL, O_NONBLOCK) == 0);
+  while (write(p[1], junk, sizeof(junk)) > 0) { }
+  while (write(p[1], junk, 1) == 1) { }
+  assert(fcntl(p[1], F_SETFL, 0) == 0);
+  deinit_from_cb_stderr(p[1]);                    /* full: the line is dropped and counted */
+  assert(fcntl(p[0], F_SETFL, O_NONBLOCK) == 0);
+  while (read(p[0], junk, sizeof(junk)) > 0) { } /* drained */
+  g_deinit_rc = 99;
+  deinit_from_cb_stderr(p[1]);
+  char buf[512] = {0};
+  ssize_t n = read(p[0], buf, sizeof(buf) - 1);
+  printf("     S37e: %s", n > 0 ? buf : "(nothing)\n");
+  fflush(stdout);
+  assert(n > 0 && strstr(buf, "libpinedio-usb: 1 diagnostic line(s) dropped (stderr full)\n") == buf &&
+         strstr(buf, "pinedio_deinit: called from a poll callback, refused\n"));
+}
+static void s37g(void) {
+  signal(SIGPIPE, SIG_DFL);
+  int p[2];
+  assert(pipe(p) == 0);
+  g_close_at_diag = p[0];
+  deinit_from_cb_stderr(p[1]);
+  sigset_t pending;
+  assert(g_close_at_diag == -1 && sigpending(&pending) == 0 && !sigismember(&pending, SIGPIPE));
+}
+static void s37h(void) {
+  signal(SIGPIPE, SIG_DFL);
+  int s[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
+  close(s[0]);
+  deinit_from_cb_stderr(s[1]);
+}
+static void s37i(void) {
+  FILE *log = tmpfile();
+  deinit_from_cb_stderr(fileno(log));
+  g_deinit_rc = 99;
+  deinit_from_cb_stderr(fileno(log));
+  rewind(log);
+  char line[256];
+  int n = 0;
+  while (fgets(line, sizeof(line), log))
+    if (!strcmp(line, "pinedio_deinit: called from a poll callback, refused\n")) n++;
+  printf("     S37i: %d lines in the file\n", n);
+  fflush(stdout);
+  assert(n == 2);
+}
+static void s37f(void) {
+  int m = posix_openpt(O_RDWR | O_NOCTTY);
+  assert(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+  int t = open(ptsname(m), O_RDWR | O_NOCTTY);
+  assert(t >= 0);
+  deinit_from_cb_stderr(t);
+  char buf[512] = {0};
+  struct pollfd q = { .fd = m, .events = POLLIN };
+  assert(poll(&q, 1, 1000) == 1);
+  ssize_t n = read(m, buf, sizeof(buf) - 1);
+  assert(n > 0 && strstr(buf, "pinedio_deinit: called from a poll callback, refused"));
+}
+
+/* S38: deinit's join ends by its one deadline too. The worker leaves its loop (worker_done) and returns, but a
+ * thread-local destructor a poll callback set does not return: deinit returns -1 within its deadline, nothing
+ * released; once the destructor returns, deinit returns 0. Before, the join after worker_done had no deadline. */
+static pthread_key_t g_tls_key;
+static struct hold H_tls;
+static void tls_dtor(void *v) { (void) v; hold_point(&H_tls); }
+static void cb_tls(void) { pthread_setspecific(g_tls_key, (void *) 1); event(EV_CB_A); }
+static void s38(void) {
+  assert(pthread_key_create(&g_tls_key, tls_dtor) == 0);
+  arm(&H_tls);
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_tls);
+  set_input(0x01);
+  wait_event(EV_CB_A);                            /* the worker thread now has a destructor to run at its exit */
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int drc = pinedio_deinit(inst);
+  long ms = ms_since(&t0);
+  printf("     S38: deinit rc %d after %ld ms\n", drc, ms);
+  fflush(stdout);
+  assert(drc == -1 && ms < PINEDIO_DRAIN_MS + 500 && inst->worker_started && g_fake_freed == 0);
+  wait_arrived(&H_tls);                           /* the worker left its loop: only its destructor holds it */
+  release(&H_tls);
+  assert(pinedio_deinit(inst) == 0);
+  free(inst);
+}
+
 /* ---- runner -------------------------------------------------------------------------------------------------- */
 static int run(const char *name, void (*fn)(void)) {
   fflush(stdout);
@@ -1504,6 +1661,16 @@ int main(int argc, char **argv) {
     {"S36a stderr blocked: an abandoning call and deinit's refusal return", s36a},
     {"S36b stderr blocked: deinit -1 while a poll callback does not return", s36b},
     {"S36c stderr blocked: deinit from a poll callback returns -1", s36c},
+    {"S37a stderr a pipe with room: the line arrives", s37a},
+    {"S37b stderr a pipe without a reader: no SIGPIPE", s37b},
+    {"S37c stderr a socket: the line arrives", s37c},
+    {"S37d stderr a full socket: the line is dropped, nothing blocks", s37d},
+    {"S37e stderr a full pipe: dropped, counted, the count precedes the next line", s37e},
+    {"S37f stderr a terminal: the line arrives", s37f},
+    {"S37g stderr's reader goes before the write: no SIGPIPE", s37g},
+    {"S37h stderr a socket without a peer: no SIGPIPE", s37h},
+    {"S37i stderr a regular file: every line appended", s37i},
+    {"S38 deinit's join ends by its deadline (a worker's exit that does not return)", s38},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
     {"S16 a failed join releases nothing", s16},
