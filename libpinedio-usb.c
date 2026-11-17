@@ -73,10 +73,16 @@
  *   (EFBIG, a file at RLIMIT_FSIZE) this write raised is consumed, one pending before it stays pending; a blocked
  *   SIGTTOU lets a background process write to a TOSTOP terminal instead of being stopped.
  * A line that is not written in full is dropped and counted (the count saturates; it covers the whole library);
- * the next line written is preceded by the count, and by a newline when a short write left half a line. errno is
- * the caller's again on return. Never through stdio: a thread blocked in fprintf holds stderr's stream lock.
- * Not bounded: a regular file on a stuck filesystem (no non-blocking write exists for regular files); the daemon's
- * own log lines stall on the same file. */
+ * the next line written is preceded by the count, and by a newline when a short write left half a line (best-effort
+ * across threads: a line another thread writes in between can come first, still on the half line). errno is the
+ * caller's again on return. Never through stdio: a thread blocked in fprintf holds stderr's stream lock.
+ * Not bounded:
+ * - a regular file on a stuck filesystem (no non-blocking write exists for regular files); the daemon's own log
+ *   lines stall on the same file;
+ * - (theoretical) another thread redirects or closes fd 2 while a line is written, so the close of the dup (or of
+ *   the private open) is the last one: of a TCP socket with SO_LINGER and unsent data it waits up to the linger
+ *   time (measured, O_NONBLOCK or not); of a serial terminal with stopped output it waits for the drain, up to the
+ *   port's closing_wait. */
 #include "libpinedio-usb-diag.h"
 static unsigned long diag_dropped;   /* lines dropped since the last line written (atomic, saturating) */
 static int diag_half_line;           /* a short write left half a line (atomic) */

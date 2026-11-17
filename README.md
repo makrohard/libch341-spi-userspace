@@ -21,8 +21,11 @@ Userspace driver for [PINE64 LoRa USB Adapter](https://pine64.com/product/pinedi
   and SIGTTOU blocked around the write). A line stderr cannot take whole is dropped and counted (a short write
   ends with a newline before the next line); the count, for the whole library, precedes the next line. errno is
   kept. So a full, closed or redirected stderr, a log file at its size limit or a background terminal never holds
-  a call, the poll thread or `pinedio_deinit`. Not bounded: a log file on a stuck filesystem. libusb's own log is
-  off (set `LIBUSB_DEBUG` to see it). "Failed to set CS pin." now goes to stderr, not stdout.
+  a call, the poll thread or `pinedio_deinit`. The newline after a short write is best-effort across threads. Not
+  bounded: a log file on a stuck filesystem; and (theoretical) when another thread redirects or closes fd 2 during a
+  line, the library's close of its stderr copy can be the last close of a TCP socket with `SO_LINGER` and unsent
+  data (waits up to the linger time) or of a serial terminal with stopped output (waits for the drain, up to its
+  `closing_wait`). libusb's own log is off (set `LIBUSB_DEBUG` to see it). "Failed to set CS pin." now goes to stderr, not stdout.
 - One `pinedio_write_read` / `pinedio_transceive` moves at most `PINEDIO_SPI_MAX` (65536) bytes; a longer one
   returns -1 without a transfer. An empty one returns 0.
 - A USB read error no longer ends the thread: `in_error` stays set until `pinedio_deinit`.
