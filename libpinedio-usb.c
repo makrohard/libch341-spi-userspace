@@ -14,6 +14,7 @@
 #define _GNU_SOURCE   /* pthread_mutex_clocklock (glibc) */
 #endif
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -58,73 +59,117 @@
 
 /* Diagnostics. Nothing writes while the USB mutex is held: a stalled stderr (a full pipe nobody reads) would hold
  * the mutex, every other caller and deinit's deadline. Lines are collected in the instance under the mutex
- * (truncated when the buffer is full) and written after the unlock, best-effort, by a write that cannot wait and
- * cannot raise SIGPIPE in the caller:
- * - a regular file: write() (it waits for no reader);
+ * (truncated when the buffer is full) and written after the unlock, best-effort, by a write that cannot wait for
+ * a reader and cannot end or stop the caller:
+ * - one owned descriptor, a close-on-exec dup of fd 2: it is classified and written on, so a later redirect of
+ *   fd 2 changes neither the class nor the target;
+ * - a regular file: write() on the dup (fd 2's own offset and O_APPEND; never a new open, which would write at
+ *   offset 0);
  * - a socket: send() with MSG_DONTWAIT | MSG_NOSIGNAL;
- * - a pipe, FIFO or terminal: write() on a private O_NONBLOCK open of the same pipe or terminal
- *   (/proc/self/fd/2), so a full one returns EAGAIN at once. Polling stderr itself is not enough (another writer
- *   can fill it between the poll and the write), and O_NONBLOCK on stderr itself would change it for the whole
- *   process. SIGPIPE is blocked around that write and a SIGPIPE it raised is consumed.
- * A line that is not written is dropped and counted; the next line written is preceded by the count. Never
- * through stdio: a thread blocked in fprintf holds stderr's stream lock. */
-static unsigned long diag_dropped;   /* lines dropped since the last line written (atomic) */
-static bool write_nosigpipe(int fd, const char *s, size_t n) {
-  sigset_t pipe_set, old, pending;
-  sigemptyset(&pipe_set);
-  sigaddset(&pipe_set, SIGPIPE);
-  pthread_sigmask(SIG_BLOCK, &pipe_set, &old);
-  bool was_pending = sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE);
+ * - a pipe, FIFO or terminal: write() on a private O_NONBLOCK open of the dup (/proc/self/fd/<dup>), so a full one
+ *   returns EAGAIN at once and a pipe without a reader fails the open (ENXIO). O_NONBLOCK on stderr itself would
+ *   change it for the whole process; polling first is not enough (another writer can fill it in between);
+ * - SIGPIPE, SIGXFSZ and SIGTTOU are blocked in the calling thread around the write: a SIGPIPE (EPIPE) or SIGXFSZ
+ *   (EFBIG, a file at RLIMIT_FSIZE) this write raised is consumed, one pending before it stays pending; a blocked
+ *   SIGTTOU lets a background process write to a TOSTOP terminal instead of being stopped.
+ * A line that is not written in full is dropped and counted (the count saturates; it covers the whole library);
+ * the next line written is preceded by the count, and by a newline when a short write left half a line. errno is
+ * the caller's again on return. Never through stdio: a thread blocked in fprintf holds stderr's stream lock.
+ * Not bounded: a regular file on a stuck filesystem (no non-blocking write exists for regular files); the daemon's
+ * own log lines stall on the same file. */
+#include "libpinedio-usb-diag.h"
+static unsigned long diag_dropped;   /* lines dropped since the last line written (atomic, saturating) */
+static int diag_half_line;           /* a short write left half a line (atomic) */
+static void diag_count(unsigned long k) {
+  unsigned long cur = __atomic_load_n(&diag_dropped, __ATOMIC_SEQ_CST), next;
+  do
+    next = cur > ULONG_MAX - k ? ULONG_MAX : cur + k;
+  while (!__atomic_compare_exchange_n(&diag_dropped, &cur, next, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+}
+/* One write of s on the owned descriptor d, with the signals above blocked; the bytes written, or -1. */
+static ssize_t diag_write(int d, const char *s, size_t n) {
+  struct stat st;
+  if (fstat(d, &st) != 0)
+    return -1;
+  if (S_ISSOCK(st.st_mode)) {
+    PINEDIO_TEST_HOOK(diag_before_write);
+    return send(d, s, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
+  int fd = d;
+  if (!S_ISREG(st.st_mode)) {
+    char path[32];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", d);
+    fd = open(path, O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0)
+      return -1;   /* also a pipe without a reader (ENXIO) */
+  }
+  sigset_t set, old, before;
+  sigemptyset(&set);
+  sigaddset(&set, SIGPIPE);
+  sigaddset(&set, SIGXFSZ);
+  sigaddset(&set, SIGTTOU);
+  pthread_sigmask(SIG_BLOCK, &set, &old);
+  sigpending(&before);
+  PINEDIO_TEST_HOOK(diag_before_write);   /* fd 2 can be redirected, a reader can go, before the write */
   ssize_t r = write(fd, s, n);
-  if (r < 0 && errno == EPIPE && !was_pending) {
+  int sig = r < 0 && errno == EPIPE ? SIGPIPE : r < 0 && errno == EFBIG ? SIGXFSZ : 0;
+  if (sig && !sigismember(&before, sig)) {
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, sig);
     struct timespec zero = { 0, 0 };
-    sigtimedwait(&pipe_set, NULL, &zero);   /* the SIGPIPE this write raised, not a pending one of the caller's */
+    sigtimedwait(&one, NULL, &zero);   /* the signal this write raised, not a pending one of the caller's */
   }
   pthread_sigmask(SIG_SETMASK, &old, NULL);
-  return r == (ssize_t) n;
-}
-static bool diag_write(const char *s, size_t n) {
-  struct stat st;
-  if (fstat(STDERR_FILENO, &st) != 0)
-    return false;
-  if (S_ISREG(st.st_mode))
-    return write(STDERR_FILENO, s, n) == (ssize_t) n;
-  if (S_ISSOCK(st.st_mode))
-    return send(STDERR_FILENO, s, n, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t) n;
-  int fd = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-  if (fd < 0)
-    return false;   /* also a pipe without a reader (ENXIO) */
-  PINEDIO_TEST_HOOK(diag_opened);   /* a reader can still go before the write */
-  bool ok = write_nosigpipe(fd, s, n);
-  close(fd);
-  return ok;
+  if (fd != d)
+    close(fd);
+  return r;
 }
 static void diag_print(const char *s) {
   size_t n = strlen(s);
   if (n == 0)
     return;
-  unsigned long dropped = __atomic_exchange_n(&diag_dropped, 0, __ATOMIC_SEQ_CST);
-  if (dropped > 0) {
-    char note[96];
-    int m = snprintf(note, sizeof(note), "libpinedio-usb: %lu diagnostic line(s) dropped (stderr full)\n", dropped);
-    if (m <= 0 || !diag_write(note, (size_t) m)) {
-      __atomic_fetch_add(&diag_dropped, dropped + 1, __ATOMIC_SEQ_CST);
-      return;
-    }
+  int saved_errno = errno;
+  int d = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0);
+  if (d < 0) {
+    diag_count(1);
+    errno = saved_errno;
+    return;
   }
-  if (!diag_write(s, n))
-    __atomic_fetch_add(&diag_dropped, 1, __ATOMIC_SEQ_CST);
+  char buf[512];
+  int half = __atomic_exchange_n(&diag_half_line, 0, __ATOMIC_SEQ_CST);
+  unsigned long dropped = __atomic_exchange_n(&diag_dropped, 0, __ATOMIC_SEQ_CST);
+  int m = 0;
+  if (half)
+    buf[m++] = '\n';
+  if (dropped > 0)
+    m += snprintf(buf + m, sizeof(buf) - (size_t) m, "libpinedio-usb: %lu diagnostic line(s) dropped (stderr full)\n",
+                  dropped);
+  m += snprintf(buf + m, sizeof(buf) - (size_t) m, "%s", s);
+  size_t len = (size_t) m < sizeof(buf) ? (size_t) m : sizeof(buf) - 1;
+  ssize_t r = diag_write(d, buf, len);
+  close(d);
+  if (r != (ssize_t) len) {
+    diag_count(dropped + 1);   /* the count is not out yet; this line is lost */
+    if (r > 0 || half)
+      __atomic_store_n(&diag_half_line, 1, __ATOMIC_SEQ_CST);
+  }
+  errno = saved_errno;
 }
-/* A formatted line through diag_print: every line of the library goes this way, also outside the mutex. */
-static void diag_printf(const char *fmt, ...) {
+/* A formatted line through diag_print: every line of the library goes this way, also outside the mutex; and the
+ * adapter's lines (ch341_adapter.c) through the private header. */
+void pinedio_diag_printf(const char *fmt, ...) {
+  int saved_errno = errno;
   char line[256];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(line, sizeof(line), fmt, ap);
   va_end(ap);
+  errno = saved_errno;
   if (n > 0)
     diag_print(line);
 }
+#define diag_printf pinedio_diag_printf
 static void diag(struct pinedio_inst *inst, const char *fmt, ...) {
   size_t used = inst->diag_len, cap = sizeof(inst->diag);
   if (used >= cap - 1)

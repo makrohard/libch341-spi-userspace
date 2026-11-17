@@ -10,6 +10,9 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <termios.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <dirent.h>
@@ -82,10 +85,12 @@ static int is_d_thread(void) {
   return r;
 }
 
-static int g_close_at_diag = -1;   /* S37g: the pipe's read end, closed between diag_write's open and its write */
+static int g_close_at_diag = -1;   /* S37g/S39d: the pipe's read end, closed after the class is decided, before the write */
+static int g_redirect_at_diag = -1;   /* S39b: dup2'd onto fd 2 after the class is decided, before the write */
 static void test_hook(const char *name) {
-  if (!strcmp(name, "diag_opened")) {
+  if (!strcmp(name, "diag_before_write")) {
     if (g_close_at_diag >= 0) { close(g_close_at_diag); g_close_at_diag = -1; }
+    if (g_redirect_at_diag >= 0) { dup2(g_redirect_at_diag, 2); g_redirect_at_diag = -1; }
   } else if (!strcmp(name, "in_read")) {
     pthread_mutex_lock(&g_m); g_polls++; pthread_cond_broadcast(&g_c); pthread_mutex_unlock(&g_m);
     hold_point(&H_in_read);
@@ -1524,14 +1529,43 @@ static void s37e(void) {
   assert(n > 0 && strstr(buf, "libpinedio-usb: 1 diagnostic line(s) dropped (stderr full)\n") == buf &&
          strstr(buf, "pinedio_deinit: called from a poll callback, refused\n"));
 }
+/* The deinit from a poll callback, with a look at the writing thread itself (the worker): g_cb_pre runs before the
+ * deinit, then the worker's pending signals and errno are recorded after it. */
+static void (*g_cb_pre)(void);
+static int g_cb_errno, g_cb_pipe_pending = -1, g_cb_hook_ran;
+static void cb_deinit_look(void) {
+  if (g_cb_pre) g_cb_pre();
+  errno = EDOM;
+  g_deinit_rc = pinedio_deinit(g_inst);
+  g_cb_errno = errno;
+  sigset_t pending;
+  g_cb_pipe_pending = sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE);
+  g_cb_hook_ran = g_close_at_diag == -1;
+  if (g_deinit_rc == 0) g_wrapper_freed = 1;
+}
+static void deinit_look_stderr(int fd) {
+  struct pinedio_inst *inst = open_inst();
+  attach_d0(inst, cb_deinit_look);
+  fflush(stderr);
+  int saved = dup(2);
+  dup2(fd, 2);
+  set_input(0x01);
+  int p = polls();
+  wait_polls(p + 2);
+  dup2(saved, 2);
+  close(saved);
+  assert(g_deinit_rc == -1 && g_wrapper_freed == 0);
+  close_inst(inst);
+}
+/* S37g: the reader goes after the class is decided, before the write (the write fails EPIPE), SIGPIPE at its
+ * default: the process lives, and the writing thread has no SIGPIPE pending afterwards. */
 static void s37g(void) {
   signal(SIGPIPE, SIG_DFL);
   int p[2];
   assert(pipe(p) == 0);
   g_close_at_diag = p[0];
-  deinit_from_cb_stderr(p[1]);
-  sigset_t pending;
-  assert(g_close_at_diag == -1 && sigpending(&pending) == 0 && !sigismember(&pending, SIGPIPE));
+  deinit_look_stderr(p[1]);
+  assert(g_cb_hook_ran && g_cb_pipe_pending == 0);
 }
 static void s37h(void) {
   signal(SIGPIPE, SIG_DFL);
@@ -1565,6 +1599,170 @@ static void s37f(void) {
   assert(poll(&q, 1, 1000) == 1);
   ssize_t n = read(m, buf, sizeof(buf) - 1);
   assert(n > 0 && strstr(buf, "pinedio_deinit: called from a poll callback, refused"));
+}
+
+/* S39, through the same public path: the gate-2 states a diagnostic must survive.
+ * (a) stderr a regular file at RLIMIT_FSIZE, SIGXFSZ at its default: the process lives, the line is dropped.
+ * (b) fd 2 redirected to a full pipe after the class is decided: the line goes to the descriptor that was
+ *     classified (the regular file), nothing blocks.
+ * (c) stderr the controlling terminal with TOSTOP, the caller in a background process group: not stopped, the
+ *     line arrives.
+ * (d) SIGPIPE already blocked and pending in the writing thread: still pending after a write that failed EPIPE.
+ * (e) the dropped count at its maximum stays there and is reported in full.
+ * (f) errno is the caller's after the line (here a pipe without a reader).
+ * (g) O_APPEND kept: stderr an appended file with content, another writer appends between two lines: nothing is
+ *     overwritten, every line lands at the end, in order (the production log: LHPC appends stdout and stderr).
+ * (h) a short write (a file reaching RLIMIT_FSIZE inside the line) leaves half a line: the next line starts on a
+ *     new line. */
+static void fsize_limit(rlim_t cur) {
+  struct rlimit rl;
+  assert(getrlimit(RLIMIT_FSIZE, &rl) == 0);
+  rl.rlim_cur = cur;
+  assert(setrlimit(RLIMIT_FSIZE, &rl) == 0);
+}
+static size_t file_text(FILE *f, char *buf, size_t cap) {
+  rewind(f);
+  size_t n = fread(buf, 1, cap - 1, f);
+  buf[n] = '\0';
+  return n;
+}
+static const char REFUSED[] = "pinedio_deinit: called from a poll callback, refused\n";
+static void s39a(void) {
+  signal(SIGXFSZ, SIG_DFL);
+  FILE *f = tmpfile();
+  assert(fputs("0123456789\n", f) >= 0 && fflush(f) == 0);
+  fsize_limit(11);                                /* nothing printed while it holds: stdout may be a file */
+  deinit_from_cb_stderr(fileno(f));
+  fsize_limit(RLIM_INFINITY);
+  char buf[512];
+  assert(file_text(f, buf, sizeof(buf)) == 11);
+}
+static void s39b(void) {
+  signal(SIGPIPE, SIG_DFL);
+  FILE *f = tmpfile();
+  int p[2];
+  assert(pipe(p) == 0);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  assert(fcntl(p[1], F_SETFL, O_NONBLOCK) == 0);
+  while (write(p[1], junk, sizeof(junk)) > 0) { }
+  while (write(p[1], junk, 1) == 1) { }
+  assert(fcntl(p[1], F_SETFL, 0) == 0);           /* full and blocking, a reader that never reads */
+  g_redirect_at_diag = p[1];
+  deinit_from_cb_stderr(fileno(f));
+  char buf[512];
+  file_text(f, buf, sizeof(buf));
+  assert(g_redirect_at_diag == -1 && !strcmp(buf, REFUSED));
+}
+static void s39c(void) {
+  assert(setsid() > 0);
+  int m = posix_openpt(O_RDWR | O_NOCTTY);
+  assert(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+  int t = open(ptsname(m), O_RDWR);               /* the session's controlling terminal */
+  assert(t >= 0 && ioctl(t, TIOCSCTTY, 0) == 0);
+  struct termios tio;
+  assert(tcgetattr(t, &tio) == 0);
+  tio.c_lflag |= TOSTOP;
+  assert(tcsetattr(t, TCSANOW, &tio) == 0);
+  pid_t w = fork();
+  if (w == 0) {                                   /* its own group: background, not orphaned (this process is in the session) */
+    signal(SIGTTOU, SIG_DFL);
+    setpgid(0, 0);
+    deinit_from_cb_stderr(t);
+    _exit(0);
+  }
+  int st = 0;
+  assert(waitpid(w, &st, WUNTRACED) == w);
+  if (WIFSTOPPED(st)) { kill(w, SIGKILL); waitpid(w, &st, 0); }
+  printf("     S39c: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "the background writer ended" : "stopped or failed");
+  fflush(stdout);
+  assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  char buf[512] = {0};
+  struct pollfd q = { .fd = m, .events = POLLIN };
+  assert(poll(&q, 1, 1000) == 1 && read(m, buf, sizeof(buf) - 1) > 0 && strstr(buf, "called from a poll callback"));
+}
+static void pre_pipe_pending(void) {
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGPIPE);
+  pthread_sigmask(SIG_BLOCK, &s, NULL);
+  pthread_kill(pthread_self(), SIGPIPE);          /* the writing thread's own, pending before the line */
+}
+static void s39d(void) {
+  int p[2];
+  assert(pipe(p) == 0);
+  g_close_at_diag = p[0];
+  g_cb_pre = pre_pipe_pending;
+  deinit_look_stderr(p[1]);
+  assert(g_cb_hook_ran && g_cb_pipe_pending == 1);
+}
+static void s39e(void) {
+  int p[2];
+  assert(pipe(p) == 0);
+  char junk[4096];
+  memset(junk, 'x', sizeof(junk));
+  assert(fcntl(p[1], F_SETFL, O_NONBLOCK) == 0);
+  while (write(p[1], junk, sizeof(junk)) > 0) { }
+  while (write(p[1], junk, 1) == 1) { }
+  assert(fcntl(p[1], F_SETFL, 0) == 0);
+  __atomic_store_n(&diag_dropped, ULONG_MAX, __ATOMIC_SEQ_CST);
+  deinit_from_cb_stderr(p[1]);                    /* full: dropped once more */
+  assert(__atomic_load_n(&diag_dropped, __ATOMIC_SEQ_CST) == ULONG_MAX);
+  assert(fcntl(p[0], F_SETFL, O_NONBLOCK) == 0);
+  while (read(p[0], junk, sizeof(junk)) > 0) { }
+  g_deinit_rc = 99;
+  deinit_from_cb_stderr(p[1]);
+  char buf[512] = {0};
+  assert(read(p[0], buf, sizeof(buf) - 1) > 0);
+  printf("     S39e: %s", buf);
+  fflush(stdout);
+  assert(strstr(buf, "libpinedio-usb: 18446744073709551615 diagnostic line(s) dropped") == buf);
+}
+static void s39f(void) {
+  signal(SIGPIPE, SIG_DFL);
+  int p[2];
+  assert(pipe(p) == 0);
+  close(p[0]);
+  deinit_look_stderr(p[1]);
+  printf("     S39f: errno %d after the line (EDOM %d)\n", g_cb_errno, EDOM);
+  fflush(stdout);
+  assert(g_cb_errno == EDOM);
+}
+static void s39g(void) {
+  FILE *f = tmpfile();
+  int fd = fileno(f);
+  assert(write(fd, "HEAD\n", 5) == 5);
+  assert(fcntl(fd, F_SETFL, O_APPEND) == 0);
+  char other_path[32];
+  snprintf(other_path, sizeof(other_path), "/proc/self/fd/%d", fd);
+  int other = open(other_path, O_WRONLY | O_APPEND);   /* another writer on its own description, appending */
+  assert(other >= 0);
+  deinit_from_cb_stderr(fd);
+  assert(write(other, "OTHER\n", 6) == 6);
+  g_deinit_rc = 99;
+  deinit_from_cb_stderr(fd);
+  char buf[512], want[512];
+  file_text(f, buf, sizeof(buf));
+  snprintf(want, sizeof(want), "HEAD\n%sOTHER\n%s", REFUSED, REFUSED);
+  printf("     S39g: %zu bytes, %s\n", strlen(buf), strcmp(buf, want) ? "not in order" : "in order");
+  fflush(stdout);
+  assert(!strcmp(buf, want));
+}
+static void s39h(void) {
+  signal(SIGXFSZ, SIG_DFL);
+  FILE *f = tmpfile();
+  assert(fputs("0123456789\n", f) >= 0 && fflush(f) == 0);
+  fsize_limit(11 + 10);                           /* the line fits 10 bytes */
+  deinit_from_cb_stderr(fileno(f));
+  fsize_limit(RLIM_INFINITY);
+  g_deinit_rc = 99;
+  deinit_from_cb_stderr(fileno(f));
+  char buf[512];
+  file_text(f, buf, sizeof(buf));
+  printf("     S39h: %s", buf + 11);
+  fflush(stdout);
+  assert(!strncmp(buf + 11, REFUSED, 10) && buf[21] == '\n' &&
+         !strncmp(buf + 22, "libpinedio-usb: 1 diagnostic line(s) dropped", 44));
 }
 
 /* S38: deinit's join ends by its one deadline too. The worker leaves its loop (worker_done) and returns, but a
@@ -1670,6 +1868,14 @@ int main(int argc, char **argv) {
     {"S37g stderr's reader goes before the write: no SIGPIPE", s37g},
     {"S37h stderr a socket without a peer: no SIGPIPE", s37h},
     {"S37i stderr a regular file: every line appended", s37i},
+    {"S39a stderr a file at RLIMIT_FSIZE: no SIGXFSZ, the line is dropped", s39a},
+    {"S39b fd 2 redirected to a full pipe before the write: no block, the line where it was classified", s39b},
+    {"S39c stderr a TOSTOP terminal, background group: not stopped, the line arrives", s39c},
+    {"S39d a SIGPIPE pending in the writing thread before the line stays pending", s39d},
+    {"S39e the dropped count saturates and is reported in full", s39e},
+    {"S39f errno is the caller's after the line", s39f},
+    {"S39g an appended stderr stays appended: nothing overwritten, in order", s39g},
+    {"S39h a short write: the next line starts on a new line", s39h},
     {"S38 deinit's join ends by its deadline (a worker's exit that does not return)", s38},
     {"S14 each device has its own pin state", s14},
     {"S15 a callback taken before a non-final detach runs once", s15},
