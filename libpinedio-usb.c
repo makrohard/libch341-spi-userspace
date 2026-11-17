@@ -150,7 +150,8 @@ static void diag_print(const char *s) {
   ssize_t r = diag_write(d, buf, len);
   close(d);
   if (r != (ssize_t) len) {
-    diag_count(dropped + 1);   /* the count is not out yet; this line is lost */
+    diag_count(dropped);   /* the count is not out yet; this line is lost (two adds: dropped may be ULONG_MAX) */
+    diag_count(1);
     if (r > 0 || half)
       __atomic_store_n(&diag_half_line, 1, __ATOMIC_SEQ_CST);
   }
